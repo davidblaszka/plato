@@ -1,0 +1,30 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python / FastAPI ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+
+# ── Docker ─────────────────────────────────────────────────────────────────
+*.log
+postgres-data/
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
