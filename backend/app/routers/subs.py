@@ -251,6 +251,9 @@ async def join_sub(
     if sub.join_policy == "invite":
         raise HTTPException(status_code=403, detail="This sub requires an invitation to join")
 
+    if sub.join_policy == "approval":
+        raise HTTPException(status_code=403, detail="This sub requires owner approval. Use request-join endpoint.")
+
     existing = await get_membership(sub.id, current_user.id, db)
     if existing:
         raise HTTPException(status_code=409, detail="You are already a member")
@@ -352,3 +355,205 @@ async def delete_sub(
         raise HTTPException(status_code=403, detail="Only the owner can delete a sub")
 
     await db.delete(sub)
+
+
+# ── Sub management endpoints ───────────────────────────────────────────────
+
+class UpdateSubRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    sub_type: str | None = None
+    join_policy: str | None = None
+
+    @field_validator("sub_type")
+    @classmethod
+    def type_valid(cls, v):
+        if v is not None and v not in ("public", "private"):
+            raise ValueError("sub_type must be 'public' or 'private'")
+        return v
+
+    @field_validator("join_policy")
+    @classmethod
+    def policy_valid(cls, v):
+        if v is not None and v not in ("open", "approval", "invite"):
+            raise ValueError("join_policy must be 'open', 'approval', or 'invite'")
+        return v
+
+
+class JoinRequestResponse(BaseModel):
+    id: str
+    user_id: str
+    username: str
+    display_name: str | None
+    avatar_url: str | None
+    status: str
+    created_at: str
+
+
+@router.patch("/{slug}", response_model=SubResponse)
+async def update_sub(
+    slug: str,
+    data: UpdateSubRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update sub settings. Owner only."""
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the owner can edit this sub")
+
+    if data.name is not None:
+        sub.name = data.name.strip()
+    if data.description is not None:
+        sub.description = data.description.strip() or None
+    if data.sub_type is not None:
+        sub.sub_type = data.sub_type
+    if data.join_policy is not None:
+        sub.join_policy = data.join_policy
+
+    await db.flush()
+    membership = await get_membership(sub.id, current_user.id, db)
+    return format_sub(sub, membership)
+
+
+@router.post("/{slug}/request-join", status_code=201)
+async def request_join(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Request to join a sub with approval join policy or private sub."""
+    from app.models.sub import SubJoinRequest
+
+    sub = await get_sub_or_404(slug, db)
+
+    existing_membership = await get_membership(sub.id, current_user.id, db)
+    if existing_membership:
+        raise HTTPException(status_code=409, detail="Already a member")
+
+    existing_request = await db.execute(
+        select(SubJoinRequest).where(
+            SubJoinRequest.sub_id == sub.id,
+            SubJoinRequest.user_id == current_user.id,
+            SubJoinRequest.status == "pending",
+        )
+    )
+    if existing_request.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Request already pending")
+
+    req = SubJoinRequest(sub_id=sub.id, user_id=current_user.id, status="pending")
+    db.add(req)
+    await db.flush()
+    return {"status": "pending", "request_id": str(req.id)}
+
+
+@router.get("/{slug}/join-requests", response_model=list[JoinRequestResponse])
+async def list_join_requests(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List pending join requests. Owner only."""
+    from app.models.sub import SubJoinRequest
+
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Owner only")
+
+    result = await db.execute(
+        select(SubJoinRequest, User)
+        .join(User, SubJoinRequest.user_id == User.id)
+        .where(SubJoinRequest.sub_id == sub.id, SubJoinRequest.status == "pending")
+        .order_by(SubJoinRequest.created_at.asc())
+    )
+    rows = result.all()
+
+    return [
+        JoinRequestResponse(
+            id=str(req.id),
+            user_id=str(user.id),
+            username=user.username,
+            display_name=user.display_name,
+            avatar_url=user.avatar_url,
+            status=req.status,
+            created_at=req.created_at.isoformat(),
+        )
+        for req, user in rows
+    ]
+
+
+@router.post("/{slug}/join-requests/{request_id}/approve", status_code=200)
+async def approve_join_request(
+    slug: str,
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve a join request. Owner only."""
+    from app.models.sub import SubJoinRequest
+    import uuid as _uuid
+
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Owner only")
+
+    result = await db.execute(
+        select(SubJoinRequest).where(SubJoinRequest.id == _uuid.UUID(request_id))
+    )
+    req = result.scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req.status = "approved"
+    membership = SubMembership(sub_id=sub.id, user_id=req.user_id, role="member")
+    db.add(membership)
+    sub.member_count += 1
+    await db.flush()
+    return {"status": "approved"}
+
+
+@router.post("/{slug}/join-requests/{request_id}/reject", status_code=200)
+async def reject_join_request(
+    slug: str,
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reject a join request. Owner only."""
+    from app.models.sub import SubJoinRequest
+    import uuid as _uuid
+
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Owner only")
+
+    result = await db.execute(
+        select(SubJoinRequest).where(SubJoinRequest.id == _uuid.UUID(request_id))
+    )
+    req = result.scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req.status = "rejected"
+    await db.flush()
+    return {"status": "rejected"}
+
+
+@router.get("/{slug}/my-join-request")
+async def get_my_join_request(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Check if current user has a pending join request for this sub."""
+    from app.models.sub import SubJoinRequest
+
+    sub = await get_sub_or_404(slug, db)
+    result = await db.execute(
+        select(SubJoinRequest).where(
+            SubJoinRequest.sub_id == sub.id,
+            SubJoinRequest.user_id == current_user.id,
+        )
+    )
+    req = result.scalar_one_or_none()
+    return {"status": req.status if req else None}
