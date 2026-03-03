@@ -22,7 +22,7 @@ class Post(Base):
     media_urls: Mapped[list] = mapped_column(ARRAY(String), default=list)
     is_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     comment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    upvote_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heart_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_removed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     removed_reason: Mapped[str | None] = mapped_column(String(500))

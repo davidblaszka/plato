@@ -259,7 +259,7 @@ async def toggle_profile_post_vote(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from app.models.social import ProfilePostVote
+    from app.models.social import ProfilePostHeart
     pid = parse_uuid(post_id)
 
     result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
@@ -268,20 +268,20 @@ async def toggle_profile_post_vote(
         raise HTTPException(status_code=404, detail="Post not found")
 
     existing = await db.execute(
-        select(ProfilePostVote).where(
-            ProfilePostVote.user_id == current_user.id,
-            ProfilePostVote.post_id == pid,
+        select(ProfilePostHeart).where(
+            ProfilePostHeart.user_id == current_user.id,
+            ProfilePostHeart.post_id == pid,
         )
     )
     vote = existing.scalar_one_or_none()
     if vote:
         await db.delete(vote)
-        post.upvote_count = max(0, post.upvote_count - 1)
-        has_voted = False
+        post.heart_count = max(0, post.heart_count - 1)
+        has_hearted = False
     else:
-        db.add(ProfilePostVote(user_id=current_user.id, post_id=pid))
-        post.upvote_count += 1
-        has_voted = True
+        db.add(ProfilePostHeart(user_id=current_user.id, post_id=pid))
+        post.heart_count += 1
+        has_hearted = True
 
     await db.flush()
-    return {"upvote_count": post.upvote_count, "has_voted": has_voted}
+    return {"heart_count": post.heart_count, "has_hearted": has_hearted}

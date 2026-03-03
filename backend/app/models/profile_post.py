@@ -14,6 +14,6 @@ class ProfilePost(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     media_urls: Mapped[list] = mapped_column(ARRAY(String), default=list, server_default='{}')
     is_edited: Mapped[bool] = mapped_column(Boolean, default=False)
-    upvote_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heart_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

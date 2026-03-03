@@ -9,6 +9,7 @@ from app.core.security import get_current_user
 from app.models.user import User
 from app.models.sub import Sub, SubMembership
 from app.models.post import Post, Comment
+from app.models.social import PostHeart, CommentHeart
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["posts"])
@@ -73,6 +74,8 @@ class CommentResponse(BaseModel):
     author: AuthorInfo
     content: str
     is_edited: bool
+    heart_count: int = 0
+    has_hearted: bool = False
     created_at: str
     replies: list["CommentResponse"] = []
 
@@ -86,10 +89,10 @@ class PostResponse(BaseModel):
     media_urls: list[str]
     is_edited: bool
     comment_count: int
-    upvote_count: int = 0
+    heart_count: int = 0
     is_pinned: bool = False
     is_removed: bool = False
-    has_voted: bool = False
+    has_hearted: bool = False
     created_at: str
     updated_at: str
 
@@ -138,7 +141,7 @@ async def get_user_by_id(user_id, db: AsyncSession) -> User:
     return result.scalar_one_or_none()
 
 
-def format_post(post: Post, author: User, sub_slug: str, has_voted: bool = False) -> PostResponse:
+def format_post(post: Post, author: User, sub_slug: str, has_hearted: bool = False) -> PostResponse:
     return PostResponse(
         id=str(post.id),
         sub_id=str(post.sub_id),
@@ -153,16 +156,16 @@ def format_post(post: Post, author: User, sub_slug: str, has_voted: bool = False
         media_urls=post.media_urls or [],
         is_edited=post.is_edited,
         comment_count=post.comment_count,
-        upvote_count=post.upvote_count,
+        heart_count=post.heart_count,
         is_pinned=post.is_pinned,
         is_removed=post.is_removed,
-        has_voted=has_voted,
+        has_hearted=has_hearted,
         created_at=post.created_at.isoformat(),
         updated_at=post.updated_at.isoformat(),
     )
 
 
-def format_comment(comment: Comment, author: User) -> CommentResponse:
+def format_comment(comment: Comment, author: User, has_hearted: bool = False) -> CommentResponse:
     return CommentResponse(
         id=str(comment.id),
         post_id=str(comment.post_id),
@@ -175,6 +178,8 @@ def format_comment(comment: Comment, author: User) -> CommentResponse:
         ),
         content=comment.content,
         is_edited=comment.is_edited,
+        heart_count=getattr(comment, 'heart_count', 0),
+        has_hearted=has_hearted,
         created_at=comment.created_at.isoformat(),
     )
 
@@ -227,7 +232,7 @@ async def list_sub_posts(
 
     stmt = select(Post).where(Post.sub_id == sub.id, Post.is_removed == False)
     if sort == "top":
-        stmt = stmt.order_by(Post.is_pinned.desc(), Post.upvote_count.desc(), Post.created_at.desc())
+        stmt = stmt.order_by(Post.is_pinned.desc(), Post.heart_count.desc(), Post.created_at.desc())
     else:
         stmt = stmt.order_by(Post.is_pinned.desc(), Post.created_at.desc())
     stmt = stmt.limit(limit).offset(offset)
@@ -243,14 +248,13 @@ async def list_sub_posts(
 
 
 @router.post("/posts/{post_id}/vote", status_code=200)
-async def toggle_vote(
+async def toggle_heart(
     post_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Toggle upvote on a post. Returns new vote count and whether user has voted."""
     import uuid as _uuid
-    from app.models.social import PostVote
     try:
         pid = _uuid.UUID(post_id)
     except ValueError:
@@ -262,21 +266,21 @@ async def toggle_vote(
         raise HTTPException(status_code=404, detail="Post not found")
 
     existing = await db.execute(
-        select(PostVote).where(PostVote.user_id == current_user.id, PostVote.post_id == pid)
+        select(PostHeart).where(PostHeart.user_id == current_user.id, PostHeart.post_id == pid)
     )
     vote = existing.scalar_one_or_none()
 
     if vote:
         await db.delete(vote)
-        post.upvote_count = max(0, post.upvote_count - 1)
-        has_voted = False
+        post.heart_count = max(0, post.heart_count - 1)
+        has_hearted = False
     else:
-        db.add(PostVote(user_id=current_user.id, post_id=pid))
-        post.upvote_count = post.upvote_count + 1
-        has_voted = True
+        db.add(PostHeart(user_id=current_user.id, post_id=pid))
+        post.heart_count = post.heart_count + 1
+        has_hearted = True
 
     await db.flush()
-    return {"upvote_count": post.upvote_count, "has_voted": has_voted}
+    return {"heart_count": post.heart_count, "has_hearted": has_hearted}
 
 
 @router.post("/posts/{post_id}/pin", status_code=200)
@@ -505,9 +509,21 @@ async def list_comments(
     authors_result = await db.execute(select(User).where(User.id.in_(author_ids)))
     authors = {u.id: u for u in authors_result.scalars().all()}
 
+    # Fetch which comments current user has hearted
+    hearted_ids: set = set()
+    if current_user and comments:
+        comment_ids = [c.id for c in comments]
+        hearts_result = await db.execute(
+            select(CommentHeart.comment_id).where(
+                CommentHeart.user_id == current_user.id,
+                CommentHeart.comment_id.in_(comment_ids),
+            )
+        )
+        hearted_ids = {r for r in hearts_result.scalars().all()}
+
     # Build threaded structure
     formatted = {
-        str(c.id): format_comment(c, authors[c.author_id])
+        str(c.id): format_comment(c, authors[c.author_id], has_hearted=c.id in hearted_ids)
         for c in comments if c.author_id in authors
     }
 
@@ -558,3 +574,41 @@ async def delete_comment(
         raise HTTPException(status_code=403, detail="Not authorized to delete this comment")
 
     await db.delete(comment)
+
+
+@router.post("/comments/{comment_id}/heart", status_code=200)
+async def toggle_comment_heart(
+    comment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Toggle heart on a comment."""
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(comment_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    result = await db.execute(select(Comment).where(Comment.id == cid))
+    comment = result.scalar_one_or_none()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    existing = await db.execute(
+        select(CommentHeart).where(
+            CommentHeart.user_id == current_user.id,
+            CommentHeart.comment_id == cid,
+        )
+    )
+    heart = existing.scalar_one_or_none()
+    if heart:
+        await db.delete(heart)
+        comment.heart_count = max(0, comment.heart_count - 1)
+        has_hearted = False
+    else:
+        db.add(CommentHeart(user_id=current_user.id, comment_id=cid))
+        comment.heart_count += 1
+        has_hearted = True
+
+    await db.flush()
+    return {"heart_count": comment.heart_count, "has_hearted": has_hearted}

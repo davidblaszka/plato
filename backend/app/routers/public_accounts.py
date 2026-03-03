@@ -145,7 +145,7 @@ class PublicFeedPost(BaseModel):
     author_is_verified: bool
     content: str
     media_urls: list[str]
-    upvote_count: int
+    heart_count: int
     is_edited: bool
     created_at: str
 
@@ -174,7 +174,7 @@ async def get_public_feed(
     )
 
     if sort == "top":
-        stmt = stmt.order_by(ProfilePost.upvote_count.desc(), ProfilePost.created_at.desc())
+        stmt = stmt.order_by(ProfilePost.heart_count.desc(), ProfilePost.created_at.desc())
     else:
         stmt = stmt.order_by(ProfilePost.created_at.desc())
 
@@ -191,7 +191,7 @@ async def get_public_feed(
             author_is_verified=u.is_verified,
             content=p.content,
             media_urls=p.media_urls or [],
-            upvote_count=p.upvote_count,
+            heart_count=p.heart_count,
             is_edited=p.is_edited,
             created_at=p.created_at.isoformat(),
         )

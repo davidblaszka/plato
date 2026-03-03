@@ -39,7 +39,7 @@ class PostResult(BaseModel):
     author_username: str
     author_display_name: str | None
     author_avatar_url: str | None
-    upvote_count: int
+    heart_count: int
     comment_count: int
     created_at: str
 
@@ -133,7 +133,7 @@ async def search(
                 Post.is_removed == False,
                 Post.content.ilike(pattern),
             )
-            .order_by(Post.upvote_count.desc(), Post.created_at.desc())
+            .order_by(Post.heart_count.desc(), Post.created_at.desc())
             .limit(limit)
         )
         result = await db.execute(stmt)
@@ -145,7 +145,7 @@ async def search(
                 author_username=u.username,
                 author_display_name=u.display_name,
                 author_avatar_url=u.avatar_url,
-                upvote_count=p.upvote_count,
+                heart_count=p.heart_count,
                 comment_count=p.comment_count,
                 created_at=p.created_at.isoformat(),
             )
