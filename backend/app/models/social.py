@@ -6,8 +6,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 
-class PostVote(Base):
-    __tablename__ = "post_votes"
+class PostHeart(Base):
+    __tablename__ = "post_hearts"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -15,8 +15,8 @@ class PostVote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class ProfilePostVote(Base):
-    __tablename__ = "profile_post_votes"
+class ProfilePostHeart(Base):
+    __tablename__ = "profile_post_hearts"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
