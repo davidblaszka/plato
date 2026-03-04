@@ -7,7 +7,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart
+from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart, ConnectionPostComment
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["connections"])
@@ -30,6 +30,13 @@ class ConnectionResponse(BaseModel):
     created_at: str
 
 
+class ConnectionPostCommentResponse(BaseModel):
+    id: str
+    author: UserSummary
+    content: str
+    created_at: str
+
+
 class ConnectionPostResponse(BaseModel):
     id: str
     author: UserSummary
@@ -38,6 +45,7 @@ class ConnectionPostResponse(BaseModel):
     is_edited: bool
     heart_count: int = 0
     has_hearted: bool = False
+    comment_count: int = 0
     created_at: str
 
 
@@ -333,6 +341,7 @@ async def create_connection_post(
         is_edited=post.is_edited,
         heart_count=0,
         has_hearted=False,
+        comment_count=0,
         created_at=post.created_at.isoformat(),
     )
 
@@ -388,11 +397,59 @@ async def get_connections_feed(
             is_edited=p.is_edited,
             heart_count=p.heart_count,
             has_hearted=p.id in hearted_ids,
+            comment_count=p.comment_count,
             created_at=p.created_at.isoformat(),
         )
         for p in posts
         if p.author_id in users
     ]
+
+
+@router.get("/connections/feed/posts/{post_id}", response_model=ConnectionPostResponse)
+async def get_connection_post(
+    post_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get a single connection feed post."""
+    import uuid as _uuid
+    try:
+        pid = _uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    post = result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    # Verify viewer is an accepted connection or the author
+    connection_ids = await get_accepted_connection_ids(current_user.id, db)
+    if post.author_id != current_user.id and post.author_id not in connection_ids:
+        raise HTTPException(status_code=403, detail="Not authorised")
+
+    author_result = await db.execute(select(User).where(User.id == post.author_id))
+    author = author_result.scalar_one()
+
+    hearted_result = await db.execute(
+        select(ConnectionPostHeart).where(
+            ConnectionPostHeart.user_id == current_user.id,
+            ConnectionPostHeart.post_id == pid,
+        )
+    )
+    has_hearted = hearted_result.scalar_one_or_none() is not None
+
+    return ConnectionPostResponse(
+        id=str(post.id),
+        author=format_user(author),
+        content=post.content,
+        media_urls=post.media_urls or [],
+        is_edited=post.is_edited,
+        heart_count=post.heart_count,
+        has_hearted=has_hearted,
+        comment_count=post.comment_count,
+        created_at=post.created_at.isoformat(),
+    )
 
 
 @router.post("/connections/feed/posts/{post_id}/vote", status_code=200)
@@ -450,3 +507,132 @@ async def delete_connection_post(
     if post.author_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your post")
     await db.delete(post)
+
+
+# ── Connection post comments ───────────────────────────────────────────────
+
+class CreateCommentRequest(BaseModel):
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def content_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Comment cannot be empty")
+        if len(v) > 2000:
+            raise ValueError("Comment cannot exceed 2,000 characters")
+        return v
+
+
+async def _get_post_or_404(post_id: str, db: AsyncSession) -> ConnectionPost:
+    import uuid as _uuid
+    try:
+        pid = _uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
+    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    post = result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return post
+
+
+@router.get("/connections/feed/posts/{post_id}/comments", response_model=list[ConnectionPostCommentResponse])
+async def list_post_comments(
+    post_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0),
+):
+    """List comments on a connection feed post."""
+    post = await _get_post_or_404(post_id, db)
+
+    result = await db.execute(
+        select(ConnectionPostComment)
+        .where(ConnectionPostComment.post_id == post.id)
+        .order_by(ConnectionPostComment.created_at.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    comments = result.scalars().all()
+
+    if not comments:
+        return []
+
+    author_ids = list({c.author_id for c in comments})
+    users_result = await db.execute(select(User).where(User.id.in_(author_ids)))
+    users = {u.id: u for u in users_result.scalars().all()}
+
+    return [
+        ConnectionPostCommentResponse(
+            id=str(c.id),
+            author=format_user(users[c.author_id]),
+            content=c.content,
+            created_at=c.created_at.isoformat(),
+        )
+        for c in comments
+        if c.author_id in users
+    ]
+
+
+@router.post("/connections/feed/posts/{post_id}/comments", response_model=ConnectionPostCommentResponse, status_code=201)
+async def add_post_comment(
+    post_id: str,
+    data: CreateCommentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Add a comment to a connection feed post."""
+    post = await _get_post_or_404(post_id, db)
+
+    comment = ConnectionPostComment(
+        post_id=post.id,
+        author_id=current_user.id,
+        content=data.content,
+    )
+    db.add(comment)
+    post.comment_count += 1
+    await db.flush()
+    await db.refresh(comment)
+
+    return ConnectionPostCommentResponse(
+        id=str(comment.id),
+        author=format_user(current_user),
+        content=comment.content,
+        created_at=comment.created_at.isoformat(),
+    )
+
+
+@router.delete("/connections/feed/posts/{post_id}/comments/{comment_id}", status_code=204)
+async def delete_post_comment(
+    post_id: str,
+    comment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete your own comment."""
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(comment_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    post = await _get_post_or_404(post_id, db)
+
+    result = await db.execute(
+        select(ConnectionPostComment).where(
+            ConnectionPostComment.id == cid,
+            ConnectionPostComment.post_id == post.id,
+        )
+    )
+    comment = result.scalar_one_or_none()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if comment.author_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your comment")
+
+    await db.delete(comment)
+    post.comment_count = max(0, post.comment_count - 1)
+    await db.flush()
