@@ -11,7 +11,7 @@ class ProfilePost(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_urls: Mapped[list] = mapped_column(ARRAY(String), default=list, server_default='{}')
     is_edited: Mapped[bool] = mapped_column(Boolean, default=False)
     heart_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

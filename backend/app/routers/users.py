@@ -39,25 +39,28 @@ class ProfilePostResponse(BaseModel):
     author_username: str
     author_display_name: str | None
     author_avatar_url: str | None
-    content: str
+    content: str | None
     media_urls: list[str]
     is_edited: bool
     created_at: str
 
 
 class CreateProfilePostRequest(BaseModel):
-    content: str
+    content: str | None = None
     media_urls: list[str] = []
 
     @field_validator("content")
     @classmethod
-    def content_not_empty(cls, v):
+    def content_valid(cls, v):
+        if v is None:
+            return v
         v = v.strip()
-        if not v:
-            raise ValueError("Content cannot be empty")
         if len(v) > 10000:
             raise ValueError("Content too long")
-        return v
+        return v or None  # normalise empty string to None
+
+    def has_content(self) -> bool:
+        return bool(self.content) or bool(self.media_urls)
 
 
 def parse_uuid(user_id: str) -> uuid.UUID:
@@ -173,6 +176,8 @@ async def create_profile_post(
     uid = parse_uuid(user_id)
     if uid != current_user.id:
         raise HTTPException(status_code=403, detail="Cannot post to another user's profile")
+    if not data.has_content():
+        raise HTTPException(status_code=422, detail="Post must have text or at least one image")
     post = ProfilePost(
         author_id=current_user.id,
         content=data.content,
