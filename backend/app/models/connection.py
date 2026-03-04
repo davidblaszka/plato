@@ -42,7 +42,7 @@ class ConnectionPost(Base):
     author_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    content: Mapped[str] = mapped_column(String(10000), nullable=False)
+    content: Mapped[str | None] = mapped_column(String(10000), nullable=True)
     media_urls: Mapped[list] = mapped_column(ARRAY(String), default=list, server_default='{}')
     is_edited: Mapped[bool] = mapped_column(default=False, nullable=False)
     heart_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

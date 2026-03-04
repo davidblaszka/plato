@@ -33,7 +33,7 @@ class ConnectionResponse(BaseModel):
 class ConnectionPostResponse(BaseModel):
     id: str
     author: UserSummary
-    content: str
+    content: str | None
     media_urls: list[str] = []
     is_edited: bool
     heart_count: int = 0
@@ -42,18 +42,21 @@ class ConnectionPostResponse(BaseModel):
 
 
 class CreateConnectionPostRequest(BaseModel):
-    content: str
+    content: str | None = None
     media_urls: list[str] = []
 
     @field_validator("content")
     @classmethod
-    def content_valid(cls, v: str) -> str:
+    def content_valid(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
         v = v.strip()
-        if not v:
-            raise ValueError("Content cannot be empty")
         if len(v) > 10000:
             raise ValueError("Content cannot exceed 10,000 characters")
-        return v
+        return v or None
+
+    def has_content(self) -> bool:
+        return bool(self.content) or bool(self.media_urls)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -311,6 +314,8 @@ async def create_connection_post(
     current_user: User = Depends(get_current_user),
 ):
     """Post to your connections feed. Only your mutual connections will see this."""
+    if not data.has_content():
+        raise HTTPException(status_code=422, detail="Post must have text or at least one image")
     post = ConnectionPost(
         author_id=current_user.id,
         content=data.content,
