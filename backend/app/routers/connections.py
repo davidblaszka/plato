@@ -7,7 +7,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.connection import Connection, ConnectionPost
+from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["connections"])
@@ -36,6 +36,8 @@ class ConnectionPostResponse(BaseModel):
     content: str
     media_urls: list[str] = []
     is_edited: bool
+    heart_count: int = 0
+    has_hearted: bool = False
     created_at: str
 
 
@@ -172,6 +174,7 @@ async def send_request(
         type="connection_request",
         reference_id=conn.id,
         reference_type="connection",
+        actor_id=current_user.id,
     )
 
     return ConnectionResponse(
@@ -214,6 +217,7 @@ async def accept_request(
         type="connection_accepted",
         reference_id=conn.id,
         reference_type="connection",
+        actor_id=current_user.id,
     )
 
     return ConnectionResponse(
@@ -322,6 +326,8 @@ async def create_connection_post(
         content=post.content,
         media_urls=post.media_urls or [],
         is_edited=post.is_edited,
+        heart_count=0,
+        has_hearted=False,
         created_at=post.created_at.isoformat(),
     )
 
@@ -358,6 +364,16 @@ async def get_connections_feed(
     users_result = await db.execute(select(User).where(User.id.in_(author_ids)))
     users = {u.id: u for u in users_result.scalars().all()}
 
+    # Batch-fetch which posts the current user has hearted
+    post_ids = [p.id for p in posts]
+    hearted_result = await db.execute(
+        select(ConnectionPostHeart.post_id).where(
+            ConnectionPostHeart.user_id == current_user.id,
+            ConnectionPostHeart.post_id.in_(post_ids),
+        )
+    )
+    hearted_ids = {r for r in hearted_result.scalars().all()}
+
     return [
         ConnectionPostResponse(
             id=str(p.id),
@@ -365,11 +381,52 @@ async def get_connections_feed(
             content=p.content,
             media_urls=p.media_urls or [],
             is_edited=p.is_edited,
+            heart_count=p.heart_count,
+            has_hearted=p.id in hearted_ids,
             created_at=p.created_at.isoformat(),
         )
         for p in posts
         if p.author_id in users
     ]
+
+
+@router.post("/connections/feed/posts/{post_id}/vote", status_code=200)
+async def toggle_connection_post_heart(
+    post_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Toggle heart on a connection feed post."""
+    import uuid as _uuid
+    try:
+        pid = _uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    post = result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    existing = await db.execute(
+        select(ConnectionPostHeart).where(
+            ConnectionPostHeart.user_id == current_user.id,
+            ConnectionPostHeart.post_id == pid,
+        )
+    )
+    heart = existing.scalar_one_or_none()
+
+    if heart:
+        await db.delete(heart)
+        post.heart_count = max(0, post.heart_count - 1)
+        has_hearted = False
+    else:
+        db.add(ConnectionPostHeart(user_id=current_user.id, post_id=pid))
+        post.heart_count += 1
+        has_hearted = True
+
+    await db.flush()
+    return {"heart_count": post.heart_count, "has_hearted": has_hearted}
 
 
 @router.delete("/connections/feed/posts/{post_id}", status_code=204)

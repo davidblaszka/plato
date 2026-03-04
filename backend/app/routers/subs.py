@@ -275,6 +275,7 @@ async def join_sub(
             type="sub_join",
             reference_id=sub.id,
             reference_type="sub",
+            actor_id=current_user.id,
         )
 
     return format_sub(sub, membership)

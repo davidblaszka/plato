@@ -465,6 +465,7 @@ async def create_comment(
             type="post_comment",
             reference_id=post.id,
             reference_type="post",
+            actor_id=current_user.id,
         )
 
     # Notify parent comment author if this is a reply
@@ -474,6 +475,7 @@ async def create_comment(
             type="comment_reply",
             reference_id=post.id,
             reference_type="post",
+            actor_id=current_user.id,
         )
 
     return format_comment(comment, current_user)

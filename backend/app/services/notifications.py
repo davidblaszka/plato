@@ -46,6 +46,7 @@ async def create_notification(
     type: str,
     reference_id=None,
     reference_type: str | None = None,
+    actor_id=None,     # who triggered the notification
 ):
     """Create a notification and push updated count to the recipient."""
     notif = Notification(
@@ -53,6 +54,7 @@ async def create_notification(
         type=type,
         reference_id=reference_id,
         reference_type=reference_type,
+        actor_id=actor_id,
     )
     db.add(notif)
     await db.flush()
