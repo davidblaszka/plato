@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.social import PublicAccountFollow
+from app.models.social import PublicAccountFollow, ProfilePostHeart
 from app.models.profile_post import ProfilePost
 
 router = APIRouter(prefix="/public-accounts", tags=["public-accounts"])
@@ -146,13 +146,14 @@ class PublicFeedPost(BaseModel):
     content: str
     media_urls: list[str]
     heart_count: int
+    has_hearted: bool
     is_edited: bool
     created_at: str
 
 
 @router.get("/feed", response_model=list[PublicFeedPost])
 async def get_public_feed(
-    sort: str = "new",
+    sort: str = "hot",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -173,13 +174,26 @@ async def get_public_feed(
         .where(ProfilePost.author_id.in_(followed_ids))
     )
 
-    if sort == "top":
+    if sort == "hot":
         stmt = stmt.order_by(ProfilePost.heart_count.desc(), ProfilePost.created_at.desc())
     else:
         stmt = stmt.order_by(ProfilePost.created_at.desc())
 
     stmt = stmt.limit(100)
     result = await db.execute(stmt)
+    rows = result.all()
+
+    if not rows:
+        return []
+
+    post_ids = [p.id for p, u in rows]
+    hearted_result = await db.execute(
+        select(ProfilePostHeart.post_id).where(
+            ProfilePostHeart.user_id == current_user.id,
+            ProfilePostHeart.post_id.in_(post_ids),
+        )
+    )
+    hearted_ids = set(hearted_result.scalars().all())
 
     return [
         PublicFeedPost(
@@ -192,8 +206,9 @@ async def get_public_feed(
             content=p.content,
             media_urls=p.media_urls or [],
             heart_count=p.heart_count,
+            has_hearted=p.id in hearted_ids,
             is_edited=p.is_edited,
             created_at=p.created_at.isoformat(),
         )
-        for p, u in result.all()
+        for p, u in rows
     ]

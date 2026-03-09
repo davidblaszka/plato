@@ -7,7 +7,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart, ConnectionPostComment
+from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart, ConnectionPostComment, ConnectionPostCommentHeart
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["connections"])
@@ -20,6 +20,7 @@ class UserSummary(BaseModel):
     username: str
     display_name: str | None
     avatar_url: str | None
+    account_type: str = 'personal'
 
 
 class ConnectionResponse(BaseModel):
@@ -35,6 +36,8 @@ class ConnectionPostCommentResponse(BaseModel):
     author: UserSummary
     content: str
     created_at: str
+    heart_count: int = 0
+    has_hearted: bool = False
 
 
 class ConnectionPostResponse(BaseModel):
@@ -75,6 +78,7 @@ def format_user(user: User) -> UserSummary:
         username=user.username,
         display_name=user.display_name,
         avatar_url=user.avatar_url,
+        account_type=user.account_type,
     )
 
 
@@ -565,12 +569,23 @@ async def list_post_comments(
     users_result = await db.execute(select(User).where(User.id.in_(author_ids)))
     users = {u.id: u for u in users_result.scalars().all()}
 
+    comment_ids = [c.id for c in comments]
+    hearted_result = await db.execute(
+        select(ConnectionPostCommentHeart.comment_id).where(
+            ConnectionPostCommentHeart.user_id == current_user.id,
+            ConnectionPostCommentHeart.comment_id.in_(comment_ids),
+        )
+    )
+    hearted_ids = set(hearted_result.scalars().all())
+
     return [
         ConnectionPostCommentResponse(
             id=str(c.id),
             author=format_user(users[c.author_id]),
             content=c.content,
             created_at=c.created_at.isoformat(),
+            heart_count=c.heart_count,
+            has_hearted=c.id in hearted_ids,
         )
         for c in comments
         if c.author_id in users
@@ -636,3 +651,50 @@ async def delete_post_comment(
     await db.delete(comment)
     post.comment_count = max(0, post.comment_count - 1)
     await db.flush()
+
+
+@router.post("/connections/feed/posts/{post_id}/comments/{comment_id}/heart", status_code=200)
+async def toggle_connection_comment_heart(
+    post_id: str,
+    comment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Toggle heart on a connection post comment."""
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(comment_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    post = await _get_post_or_404(post_id, db)
+
+    result = await db.execute(
+        select(ConnectionPostComment).where(
+            ConnectionPostComment.id == cid,
+            ConnectionPostComment.post_id == post.id,
+        )
+    )
+    comment = result.scalar_one_or_none()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    existing = await db.execute(
+        select(ConnectionPostCommentHeart).where(
+            ConnectionPostCommentHeart.user_id == current_user.id,
+            ConnectionPostCommentHeart.comment_id == cid,
+        )
+    )
+    heart = existing.scalar_one_or_none()
+
+    if heart:
+        await db.delete(heart)
+        comment.heart_count = max(0, comment.heart_count - 1)
+        has_hearted = False
+    else:
+        db.add(ConnectionPostCommentHeart(user_id=current_user.id, comment_id=cid))
+        comment.heart_count += 1
+        has_hearted = True
+
+    await db.flush()
+    return {"heart_count": comment.heart_count, "has_hearted": has_hearted}
