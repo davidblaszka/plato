@@ -40,7 +40,8 @@ class MessageResponse(BaseModel):
     id: str
     conversation_id: str
     sender: ParticipantInfo
-    content: str          # decrypted for the client
+    content: str          # ciphertext for E2EE messages; plaintext for legacy
+    is_encrypted: bool    # True = client must decrypt; False = ready to display
     is_edited: bool
     created_at: str
 
@@ -48,6 +49,7 @@ class MessageResponse(BaseModel):
 class CreateDirectRequest(BaseModel):
     username: str         # who to DM
     message: str
+    is_encrypted: bool = False  # True when client sends E2EE ciphertext
 
     @field_validator("message")
     @classmethod
@@ -55,7 +57,7 @@ class CreateDirectRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Message cannot be empty")
-        if len(v) > 5000:
+        if len(v) > 10000:
             raise ValueError("Message too long")
         return v
 
@@ -64,6 +66,7 @@ class CreateGroupRequest(BaseModel):
     name: str
     usernames: list[str]  # participants (excluding yourself)
     message: str
+    is_encrypted: bool = False
 
     @field_validator("name")
     @classmethod
@@ -85,6 +88,7 @@ class CreateGroupRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
+    is_encrypted: bool = False  # True = content is E2EE ciphertext; relay as-is
 
     @field_validator("content")
     @classmethod
@@ -92,9 +96,29 @@ class SendMessageRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Message cannot be empty")
-        if len(v) > 5000:
+        if len(v) > 10000:
             raise ValueError("Message too long")
         return v
+
+
+class SendEncryptedMessageRequest(BaseModel):
+    """Per-recipient E2EE payload — used for group message fan-out."""
+    recipient_id: str
+    content: str   # base64(nonce + ciphertext) encrypted for this recipient only
+
+    @field_validator("content")
+    @classmethod
+    def content_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Content cannot be empty")
+        return v
+
+
+class MessageSyncItem(BaseModel):
+    """Lightweight sync item — id + timestamp only, no content."""
+    id: str
+    sent_at: str
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -105,6 +129,27 @@ def format_participant(user: User) -> ParticipantInfo:
         username=user.username,
         display_name=user.display_name,
         avatar_url=user.avatar_url,
+    )
+
+
+def format_message(msg: Message, sender: User) -> MessageResponse:
+    """Return message content.
+    - is_encrypted=True:  relay ciphertext as-is; client decrypts.
+    - is_encrypted=False: Fernet-decrypt for backward compat with legacy messages.
+    """
+    if msg.is_encrypted:
+        content = msg.content_encrypted  # pass-through — server never decrypts
+    else:
+        content = decrypt_message(msg.content_encrypted)  # legacy Fernet decrypt
+
+    return MessageResponse(
+        id=str(msg.id),
+        conversation_id=str(msg.conversation_id),
+        sender=format_participant(sender),
+        content=content,
+        is_encrypted=msg.is_encrypted,
+        is_edited=msg.is_edited,
+        created_at=msg.created_at.isoformat(),
     )
 
 
@@ -177,13 +222,21 @@ async def format_conversation(
         other = next((u for u in participants if u.id != current_user_id), None)
         name = other.display_name or other.username if other else "Unknown"
 
+    # Last message preview — decrypt only for legacy messages
+    last_message_text = None
+    if last_msg:
+        if last_msg.is_encrypted:
+            last_message_text = "🔒 Encrypted message"
+        else:
+            last_message_text = decrypt_message(last_msg.content_encrypted)
+
     return ConversationResponse(
         id=str(conv.id),
         type=conv.type,
         status=conv.status if hasattr(conv, 'status') else 'active',
         name=name,
         participants=[format_participant(u) for u in participants],
-        last_message=decrypt_message(last_msg.content_encrypted) if last_msg else None,
+        last_message=last_message_text,
         last_message_at=last_msg.created_at.isoformat() if last_msg else None,
         unread_count=unread,
     )
@@ -223,23 +276,26 @@ async def create_direct(
         part_ids = {p.id for p in parts}
         if other.id in part_ids and len(parts) == 2:
             # Conversation exists — just send the message
+            stored = data.message if data.is_encrypted else encrypt_message(data.message)
             msg = Message(
                 conversation_id=conv.id,
                 sender_id=current_user.id,
-                content_encrypted=encrypt_message(data.message),
+                content_encrypted=stored,
+                is_encrypted=data.is_encrypted,
             )
             db.add(msg)
             await db.flush()
             await _push_message(conv.id, msg, current_user, db)
             return await format_conversation(conv, current_user.id, db)
 
-    # Create new conversation — check if they're connections (mutual follow)
-    # If not, mark as a "request" so it appears in the requests folder
+    # Create new conversation — check if they're accepted connections
     from app.models.connection import Connection
     connection_result = await db.execute(
         select(Connection).where(
-            Connection.requester_id == current_user.id,
-            Connection.recipient_id == other.id,
+            or_(
+                and_(Connection.requester_id == current_user.id, Connection.addressee_id == other.id),
+                and_(Connection.requester_id == other.id, Connection.addressee_id == current_user.id),
+            ),
             Connection.status == "accepted",
         )
     )
@@ -253,10 +309,12 @@ async def create_direct(
     for uid in [current_user.id, other.id]:
         db.add(ConversationParticipant(conversation_id=conv.id, user_id=uid))
 
+    stored = data.message if data.is_encrypted else encrypt_message(data.message)
     msg = Message(
         conversation_id=conv.id,
         sender_id=current_user.id,
-        content_encrypted=encrypt_message(data.message),
+        content_encrypted=stored,
+        is_encrypted=data.is_encrypted,
     )
     db.add(msg)
     await db.flush()
@@ -293,10 +351,12 @@ async def create_group(
     for user in all_users:
         db.add(ConversationParticipant(conversation_id=conv.id, user_id=user.id))
 
+    stored = data.message if data.is_encrypted else encrypt_message(data.message)
     msg = Message(
         conversation_id=conv.id,
         sender_id=current_user.id,
-        content_encrypted=encrypt_message(data.message),
+        content_encrypted=stored,
+        is_encrypted=data.is_encrypted,
     )
     db.add(msg)
     await db.flush()
@@ -348,7 +408,6 @@ async def accept_message_request(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Only the recipient (not the sender) can accept
     if conv.created_by == current_user.id:
         raise HTTPException(status_code=403, detail="Cannot accept your own request")
 
@@ -381,20 +440,28 @@ async def decline_message_request(
     await db.delete(conv)
 
 
-
-
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
 async def list_messages(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(default=50, le=200),
-    before: Optional[str] = Query(default=None),  # cursor for pagination
+    before: Optional[str] = Query(default=None),
 ):
     """Get messages in a conversation. Also marks them as read."""
     participant = await require_participant(conversation_id, current_user.id, db)
 
-    query = select(Message).where(Message.conversation_id == conversation_id)
+    query = select(Message).where(
+        and_(
+            Message.conversation_id == conversation_id,
+            # Include messages where recipient_id matches current user OR is NULL
+            # (NULL = broadcast / direct / legacy message for all participants)
+            or_(
+                Message.recipient_id == current_user.id,
+                Message.recipient_id.is_(None),
+            )
+        )
+    )
     if before:
         query = query.where(Message.created_at < before)
     query = query.order_by(Message.created_at.desc()).limit(limit)
@@ -423,14 +490,7 @@ async def list_messages(
     )
 
     return [
-        MessageResponse(
-            id=str(m.id),
-            conversation_id=str(m.conversation_id),
-            sender=format_participant(senders[m.sender_id]),
-            content=decrypt_message(m.content_encrypted),
-            is_edited=m.is_edited,
-            created_at=m.created_at.isoformat(),
-        )
+        format_message(m, senders[m.sender_id])
         for m in messages
         if m.sender_id in senders
     ]
@@ -443,13 +503,21 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Send a message to a conversation."""
+    """Send a message to a conversation.
+
+    is_encrypted=False (default): server Fernet-encrypts content before storage.
+    is_encrypted=True: content is already E2EE ciphertext; stored and relayed as-is.
+    """
     await require_participant(conversation_id, current_user.id, db)
+
+    # Store raw ciphertext for E2EE; Fernet-encrypt for legacy clients
+    stored = data.content if data.is_encrypted else encrypt_message(data.content)
 
     msg = Message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
-        content_encrypted=encrypt_message(data.content),
+        content_encrypted=stored,
+        is_encrypted=data.is_encrypted,
     )
     db.add(msg)
     await db.flush()
@@ -462,16 +530,120 @@ async def send_message(
     conv = conv_result.scalar_one()
     conv.updated_at = msg.created_at
 
+    # Mark sender as read
+    from sqlalchemy import update
+    from datetime import datetime, timezone
+    await db.execute(
+        update(ConversationParticipant)
+        .where(
+            and_(
+                ConversationParticipant.conversation_id == conversation_id,
+                ConversationParticipant.user_id == current_user.id,
+            )
+        )
+        .values(last_read_at=datetime.now(timezone.utc))
+    )
+
     await _push_message(conversation_id, msg, current_user, db)
 
     return MessageResponse(
         id=str(msg.id),
         conversation_id=str(msg.conversation_id),
         sender=format_participant(current_user),
-        content=data.content,  # no need to decrypt what we just encrypted
+        content=data.content,  # return the original (plaintext or ciphertext)
+        is_encrypted=data.is_encrypted,
         is_edited=False,
         created_at=msg.created_at.isoformat(),
     )
+
+
+@router.post("/{conversation_id}/encrypted", response_model=MessageResponse, status_code=201)
+async def send_encrypted_message(
+    conversation_id: str,
+    data: SendEncryptedMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Send a per-recipient E2EE message copy (used for group message fan-out).
+
+    The client encrypts the message separately for each group participant and
+    POSTs one request per recipient. Each Message row stores the ciphertext
+    intended only for that recipient (recipient_id is set).
+    """
+    import uuid as _uuid
+    await require_participant(conversation_id, current_user.id, db)
+
+    try:
+        recipient_uuid = _uuid.UUID(data.recipient_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recipient_id")
+
+    # Verify recipient is a participant
+    await require_participant(conversation_id, recipient_uuid, db)
+
+    msg = Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content_encrypted=data.content,
+        is_encrypted=True,
+        recipient_id=recipient_uuid,
+    )
+    db.add(msg)
+    await db.flush()
+    await db.refresh(msg)
+
+    # Update conversation updated_at
+    conv_result = await db.execute(
+        select(Conversation).where(Conversation.id == conversation_id)
+    )
+    conv = conv_result.scalar_one()
+    conv.updated_at = msg.created_at
+
+    # Push only to the intended recipient
+    payload = _build_ws_payload(conversation_id, msg, current_user, data.content, is_encrypted=True)
+    await message_manager.send_to_user(data.recipient_id, payload)
+
+    return MessageResponse(
+        id=str(msg.id),
+        conversation_id=str(msg.conversation_id),
+        sender=format_participant(current_user),
+        content=data.content,
+        is_encrypted=True,
+        is_edited=False,
+        created_at=msg.created_at.isoformat(),
+    )
+
+
+@router.get("/{conversation_id}/sync", response_model=list[MessageSyncItem])
+async def sync_messages(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    since: Optional[str] = Query(default=None),  # ISO timestamp — only return newer
+):
+    """Return message IDs + timestamps only — used by client to detect missed messages.
+
+    Client compares this list against local SQLite to find gaps, then fetches
+    full message content only for missing IDs.
+    """
+    await require_participant(conversation_id, current_user.id, db)
+
+    query = select(Message.id, Message.created_at).where(
+        and_(
+            Message.conversation_id == conversation_id,
+            or_(
+                Message.recipient_id == current_user.id,
+                Message.recipient_id.is_(None),
+            )
+        )
+    )
+    if since:
+        query = query.where(Message.created_at > since)
+    query = query.order_by(Message.created_at.asc()).limit(500)
+
+    result = await db.execute(query)
+    rows = result.all()
+    return [MessageSyncItem(id=str(r.id), sent_at=r.created_at.isoformat()) for r in rows]
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────
@@ -508,18 +680,10 @@ async def messages_websocket(
         message_manager.disconnect(user_id)
 
 
-# ── Internal helper ────────────────────────────────────────────────────────
+# ── Internal helpers ────────────────────────────────────────────────────────
 
-async def _push_message(conversation_id, msg: Message, sender: User, db: AsyncSession):
-    """Push a new message to all participants who are online."""
-    result = await db.execute(
-        select(ConversationParticipant).where(
-            ConversationParticipant.conversation_id == conversation_id
-        )
-    )
-    participants = result.scalars().all()
-
-    payload = {
+def _build_ws_payload(conversation_id, msg: Message, sender: User, content: str, is_encrypted: bool) -> dict:
+    return {
         "type": "message",
         "conversation_id": str(conversation_id),
         "message": {
@@ -531,11 +695,31 @@ async def _push_message(conversation_id, msg: Message, sender: User, db: AsyncSe
                 "display_name": sender.display_name,
                 "avatar_url": sender.avatar_url,
             },
-            "content": decrypt_message(msg.content_encrypted),
+            "content": content,          # ciphertext for E2EE; plaintext for legacy
+            "is_encrypted": is_encrypted,
             "is_edited": False,
             "created_at": msg.created_at.isoformat(),
         }
     }
+
+
+async def _push_message(conversation_id, msg: Message, sender: User, db: AsyncSession):
+    """Push a new message to all participants who are online."""
+    result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == conversation_id
+        )
+    )
+    participants = result.scalars().all()
+
+    # For E2EE: relay ciphertext as-is.
+    # For legacy: decrypt so non-updated clients can still read in real-time.
+    if msg.is_encrypted:
+        content = msg.content_encrypted
+    else:
+        content = decrypt_message(msg.content_encrypted)
+
+    payload = _build_ws_payload(conversation_id, msg, sender, content, msg.is_encrypted)
 
     sender_id = str(sender.id)
     for p in participants:

@@ -169,8 +169,8 @@ async def list_subs(
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0),
 ):
-    """List public subs. Optionally filter by search term."""
-    query = select(Sub).where(Sub.sub_type == "public")
+    """List subs. Private subs appear in search unless invite-only."""
+    query = select(Sub).where(Sub.join_policy != "invite")
 
     if search:
         term = f"%{search.lower()}%"
@@ -229,9 +229,11 @@ async def get_sub(
         membership = await get_membership(sub.id, current_user.id, db)
 
     if sub.sub_type == "private" and not membership:
-        raise HTTPException(
-            status_code=403, detail="This is a private sub. Request an invitation to join."
-        )
+        if sub.join_policy == "invite":
+            raise HTTPException(
+                status_code=403, detail="This sub requires an invitation to join."
+            )
+        # Private approval sub — allow viewing so user can request to join
 
     return format_sub(sub, membership)
 
@@ -538,6 +540,38 @@ async def reject_join_request(
     req.status = "rejected"
     await db.flush()
     return {"status": "rejected"}
+
+
+@router.post("/{slug}/invite", status_code=200)
+async def invite_to_sub(
+    slug: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Directly add a user to the sub (owner only). Used for invite-only subs."""
+    username = data.get("username", "").strip().lower()
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Owner only")
+
+    result = await db.execute(select(User).where(User.username == username))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = await get_membership(sub.id, user.id, db)
+    if existing:
+        raise HTTPException(status_code=409, detail="User is already a member")
+
+    membership = SubMembership(sub_id=sub.id, user_id=user.id, role="member")
+    db.add(membership)
+    sub.member_count += 1
+    await db.flush()
+    return {"status": "added", "username": username}
 
 
 @router.get("/{slug}/my-join-request")

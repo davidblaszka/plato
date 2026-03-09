@@ -1,3 +1,5 @@
+import math
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +15,12 @@ from app.models.social import PostHeart, CommentHeart
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["posts"])
+
+
+def calc_hot_score(heart_count: int, created_at: datetime) -> float:
+    score = max(heart_count, 1)
+    epoch = created_at.timestamp()
+    return round(math.log10(score) + epoch / 45000, 7)
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────
@@ -209,6 +217,9 @@ async def create_post(
     db.add(post)
     await db.flush()
     await db.refresh(post)
+    post.hot_score = calc_hot_score(0, post.created_at)
+    await db.flush()
+    await db.refresh(post)
     return format_post(post, current_user, sub.slug)
 
 
@@ -219,9 +230,9 @@ async def list_sub_posts(
     current_user: Optional[User] = Depends(get_current_user),
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0),
-    sort: str = Query(default="new", pattern="^(new|top)$"),
+    sort: str = Query(default="hot", pattern="^(hot|new)$"),
 ):
-    """Get posts in a sub. Sort by 'new' (default) or 'top' (upvotes)."""
+    """Get posts in a sub. Sort by 'hot' (default) or 'new'."""
     sub = await get_sub_by_slug(slug, db)
 
     # Private subs require membership
@@ -231,7 +242,7 @@ async def list_sub_posts(
         await require_membership(sub, current_user, db)
 
     stmt = select(Post).where(Post.sub_id == sub.id, Post.is_removed == False)
-    if sort == "top":
+    if sort == "hot":
         stmt = stmt.order_by(Post.is_pinned.desc(), Post.heart_count.desc(), Post.created_at.desc())
     else:
         stmt = stmt.order_by(Post.is_pinned.desc(), Post.created_at.desc())
@@ -279,6 +290,7 @@ async def toggle_heart(
         post.heart_count = post.heart_count + 1
         has_hearted = True
 
+    post.hot_score = calc_hot_score(post.heart_count, post.created_at)
     await db.flush()
     return {"heart_count": post.heart_count, "has_hearted": has_hearted}
 

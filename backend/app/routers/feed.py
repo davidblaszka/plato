@@ -18,10 +18,11 @@ async def get_home_feed(
     current_user: User = Depends(get_current_user),
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0),
+    sort: str = Query(default="hot", pattern="^(hot|new)$"),
 ):
     """
     Home feed — posts from all subs the current user is a member of.
-    Chronological, newest first. No algorithmic reordering.
+    Sort by 'hot' (default) or 'new'.
     """
     # Get all sub IDs the user belongs to
     memberships_result = await db.execute(
@@ -32,14 +33,12 @@ async def get_home_feed(
     if not sub_ids:
         return []
 
-    # Fetch posts from those subs, newest first
-    posts_result = await db.execute(
-        select(Post)
-        .where(Post.sub_id.in_(sub_ids))
-        .order_by(Post.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
+    stmt = select(Post).where(Post.sub_id.in_(sub_ids))
+    if sort == "hot":
+        stmt = stmt.order_by(Post.heart_count.desc(), Post.created_at.desc())
+    else:
+        stmt = stmt.order_by(Post.created_at.desc())
+    posts_result = await db.execute(stmt.limit(limit).offset(offset))
     posts = posts_result.scalars().all()
 
     if not posts:
