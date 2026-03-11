@@ -44,6 +44,7 @@ class MessageResponse(BaseModel):
     content: str          # ciphertext for E2EE messages; plaintext for legacy
     is_encrypted: bool    # True = client must decrypt; False = ready to display
     is_edited: bool
+    client_id: str | None = None
     created_at: str
 
 
@@ -97,7 +98,7 @@ class SendMessageRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Message cannot be empty")
-        if len(v) > 10000:
+        if len(v) > 20000:
             raise ValueError("Message too long")
         return v
 
@@ -105,6 +106,7 @@ class SendMessageRequest(BaseModel):
 class SendEncryptedMessageRequest(BaseModel):
     """Per-recipient E2EE payload — used for group message fan-out."""
     recipient_id: str
+    client_id: str | None = None  # UUID that links all per-recipient copies
     content: str   # base64(nonce + ciphertext) encrypted for this recipient only
 
     @field_validator("content")
@@ -113,6 +115,42 @@ class SendEncryptedMessageRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Content cannot be empty")
+        return v
+
+
+class EditEncryptedMessageRequest(BaseModel):
+    """Per-recipient E2EE edit payload (group fan-out)."""
+    recipient_id: str
+    client_id: str
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def content_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Content cannot be empty")
+        return v
+
+
+class DeleteEncryptedMessageRequest(BaseModel):
+    """Per-recipient E2EE delete payload (group fan-out)."""
+    recipient_id: str
+    client_id: str
+
+
+class EditMessageRequest(BaseModel):
+    content: str
+    is_encrypted: bool = False  # True = content is E2EE ciphertext; relay as-is
+
+    @field_validator("content")
+    @classmethod
+    def content_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Message cannot be empty")
+        if len(v) > 20000:
+            raise ValueError("Message too long")
         return v
 
 
@@ -150,6 +188,7 @@ def format_message(msg: Message, sender: User) -> MessageResponse:
         content=content,
         is_encrypted=msg.is_encrypted,
         is_edited=msg.is_edited,
+        client_id=str(msg.client_id) if msg.client_id else None,
         created_at=msg.created_at.isoformat(),
     )
 
@@ -555,8 +594,82 @@ async def send_message(
         content=data.content,  # return the original (plaintext or ciphertext)
         is_encrypted=data.is_encrypted,
         is_edited=False,
+        client_id=str(msg.client_id) if msg.client_id else None,
         created_at=msg.created_at.isoformat(),
     )
+
+
+@router.patch("/{message_id}", response_model=MessageResponse)
+async def edit_message(
+    message_id: str,
+    data: EditMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit a message you sent."""
+    import uuid as _uuid
+    try:
+        mid = _uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    result = await db.execute(select(Message).where(Message.id == mid))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your message")
+
+    if msg.is_encrypted != data.is_encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail="is_encrypted must match existing message",
+        )
+
+    stored = data.content if data.is_encrypted else encrypt_message(data.content)
+    msg.content_encrypted = stored
+    msg.is_edited = True
+    await db.flush()
+
+    await _broadcast_message_edited(msg.conversation_id, msg, current_user, db)
+
+    return MessageResponse(
+        id=str(msg.id),
+        conversation_id=str(msg.conversation_id),
+        sender=format_participant(current_user),
+        content=data.content,
+        is_encrypted=data.is_encrypted,
+        is_edited=True,
+        client_id=str(msg.client_id) if msg.client_id else None,
+        created_at=msg.created_at.isoformat(),
+    )
+
+
+@router.delete("/{message_id}", status_code=204)
+async def delete_message(
+    message_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a message you sent."""
+    import uuid as _uuid
+    try:
+        mid = _uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    result = await db.execute(select(Message).where(Message.id == mid))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your message")
+
+    conv_id = msg.conversation_id
+    await db.delete(msg)
+    await db.flush()
+
+    await _broadcast_message_deleted(conv_id, mid, current_user.id, db)
 
 
 @router.post("/{conversation_id}/encrypted", response_model=MessageResponse, status_code=201)
@@ -583,12 +696,20 @@ async def send_encrypted_message(
     # Verify recipient is a participant
     await require_participant(conversation_id, recipient_uuid, db)
 
+    client_uuid = None
+    if data.client_id:
+        try:
+            client_uuid = _uuid.UUID(data.client_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid client_id")
+
     msg = Message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
         content_encrypted=data.content,
         is_encrypted=True,
         recipient_id=recipient_uuid,
+        client_id=client_uuid,
     )
     db.add(msg)
     await db.flush()
@@ -612,8 +733,114 @@ async def send_encrypted_message(
         content=data.content,
         is_encrypted=True,
         is_edited=False,
+        client_id=str(msg.client_id) if msg.client_id else None,
         created_at=msg.created_at.isoformat(),
     )
+
+
+@router.patch("/{conversation_id}/encrypted/edit", response_model=MessageResponse)
+async def edit_encrypted_message(
+    conversation_id: str,
+    data: EditEncryptedMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit a per-recipient E2EE message copy (group fan-out)."""
+    import uuid as _uuid
+    await require_participant(conversation_id, current_user.id, db)
+
+    try:
+        recipient_uuid = _uuid.UUID(data.recipient_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recipient_id")
+
+    try:
+        client_uuid = _uuid.UUID(data.client_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+
+    # Verify recipient is a participant
+    await require_participant(conversation_id, recipient_uuid, db)
+
+    result = await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.sender_id == current_user.id,
+            Message.recipient_id == recipient_uuid,
+            Message.client_id == client_uuid,
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    msg.content_encrypted = data.content
+    msg.is_edited = True
+    await db.flush()
+
+    # Push only to the intended recipient
+    payload = _build_ws_payload(conversation_id, msg, current_user, data.content, is_encrypted=True, is_edited=True)
+    payload["type"] = "message_edited"
+    await message_manager.send_to_user(data.recipient_id, payload)
+
+    return MessageResponse(
+        id=str(msg.id),
+        conversation_id=str(msg.conversation_id),
+        sender=format_participant(current_user),
+        content=data.content,
+        is_encrypted=True,
+        is_edited=True,
+        client_id=str(msg.client_id) if msg.client_id else None,
+        created_at=msg.created_at.isoformat(),
+    )
+
+
+@router.delete("/{conversation_id}/encrypted/delete", status_code=204)
+async def delete_encrypted_message(
+    conversation_id: str,
+    data: DeleteEncryptedMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a per-recipient E2EE message copy (group fan-out)."""
+    import uuid as _uuid
+    await require_participant(conversation_id, current_user.id, db)
+
+    try:
+        recipient_uuid = _uuid.UUID(data.recipient_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recipient_id")
+
+    try:
+        client_uuid = _uuid.UUID(data.client_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+
+    # Verify recipient is a participant
+    await require_participant(conversation_id, recipient_uuid, db)
+
+    result = await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.sender_id == current_user.id,
+            Message.recipient_id == recipient_uuid,
+            Message.client_id == client_uuid,
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    msg_id = msg.id
+    await db.delete(msg)
+    await db.flush()
+
+    payload = {
+        "type": "message_deleted",
+        "conversation_id": str(conversation_id),
+        "message_id": str(msg_id),
+    }
+    await message_manager.send_to_user(data.recipient_id, payload)
 
 
 @router.delete("/{message_id}", status_code=204)
@@ -726,7 +953,14 @@ async def messages_websocket(
 
 # ── Internal helpers ────────────────────────────────────────────────────────
 
-def _build_ws_payload(conversation_id, msg: Message, sender: User, content: str, is_encrypted: bool) -> dict:
+def _build_ws_payload(
+    conversation_id,
+    msg: Message,
+    sender: User,
+    content: str,
+    is_encrypted: bool,
+    is_edited: bool = False,
+) -> dict:
     return {
         "type": "message",
         "conversation_id": str(conversation_id),
@@ -741,7 +975,8 @@ def _build_ws_payload(conversation_id, msg: Message, sender: User, content: str,
             },
             "content": content,          # ciphertext for E2EE; plaintext for legacy
             "is_encrypted": is_encrypted,
-            "is_edited": False,
+            "is_edited": is_edited,
+            "client_id": str(msg.client_id) if msg.client_id else None,
             "created_at": msg.created_at.isoformat(),
         }
     }
@@ -763,10 +998,63 @@ async def _push_message(conversation_id, msg: Message, sender: User, db: AsyncSe
     else:
         content = decrypt_message(msg.content_encrypted)
 
-    payload = _build_ws_payload(conversation_id, msg, sender, content, msg.is_encrypted)
+    payload = _build_ws_payload(conversation_id, msg, sender, content, msg.is_encrypted, msg.is_edited)
 
     sender_id = str(sender.id)
     for p in participants:
         # Skip sender — they already have the message from the HTTP response
         if str(p.user_id) != sender_id:
             await message_manager.send_to_user(str(p.user_id), payload)
+
+
+async def _broadcast_message_deleted(conversation_id, message_id, sender_id, db: AsyncSession):
+    result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == conversation_id
+        )
+    )
+    participants = result.scalars().all()
+    payload = {
+        "type": "message_deleted",
+        "conversation_id": str(conversation_id),
+        "message_id": str(message_id),
+    }
+    for p in participants:
+        if str(p.user_id) == str(sender_id):
+            continue
+        await message_manager.send_to_user(str(p.user_id), payload)
+
+
+async def _broadcast_message_edited(
+    conversation_id,
+    msg: Message,
+    sender: User,
+    db: AsyncSession,
+):
+    # For E2EE: relay ciphertext as-is.
+    # For legacy: decrypt so non-updated clients can still read in real-time.
+    if msg.is_encrypted:
+        content = msg.content_encrypted
+    else:
+        content = decrypt_message(msg.content_encrypted)
+
+    payload = _build_ws_payload(
+        conversation_id,
+        msg,
+        sender,
+        content,
+        msg.is_encrypted,
+        True,
+    )
+    payload["type"] = "message_edited"
+
+    result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == conversation_id
+        )
+    )
+    participants = result.scalars().all()
+    for p in participants:
+        if str(p.user_id) == str(sender.id):
+            continue
+        await message_manager.send_to_user(str(p.user_id), payload)

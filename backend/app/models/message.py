@@ -65,6 +65,9 @@ class Message(Base):
     )
     content_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     is_encrypted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    client_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     recipient_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
