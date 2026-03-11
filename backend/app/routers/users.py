@@ -2,15 +2,17 @@ import math
 import uuid
 import base64
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.services.notifications import create_notification
 from app.models.user import User
-from app.models.profile_post import ProfilePost, ProfilePostComment
+from app.models.profile_post import ProfilePost, ProfilePostComment, ProfilePostCommentHeart
 from app.models.social import PublicAccountFollow
 from app.models.connection import Connection
 from sqlalchemy import func
@@ -156,24 +158,41 @@ async def get_user_profile(
     )
 
 
-@router.get("/{user_id}/profile-posts", response_model=list[ProfilePostResponse])
+class ProfilePostsPage(BaseModel):
+    posts: list[ProfilePostResponse]
+    has_more: bool
+    next_cursor: str | None
+
+
+@router.get("/{user_id}/profile-posts", response_model=ProfilePostsPage)
 async def get_profile_posts(
     user_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(default=20, le=100),
+    before: str | None = Query(default=None),
 ):
     from app.models.social import ProfilePostHeart
     user = await get_user_or_404(user_id, db)
     uid = parse_uuid(user_id)
-    result = await db.execute(
-        select(ProfilePost)
-        .where(ProfilePost.author_id == uid)
-        .order_by(ProfilePost.created_at.desc())
-        .limit(50)
-    )
-    posts = result.scalars().all()
+
+    stmt = select(ProfilePost).where(ProfilePost.author_id == uid)
+    if before is not None:
+        try:
+            stmt = stmt.where(ProfilePost.created_at < datetime.fromisoformat(before))
+        except ValueError:
+            pass
+    stmt = stmt.order_by(ProfilePost.created_at.desc()).limit(limit + 1)
+
+    result = await db.execute(stmt)
+    posts = list(result.scalars().all())
+
+    has_more = len(posts) > limit
+    if has_more:
+        posts = posts[:limit]
+
     if not posts:
-        return []
+        return ProfilePostsPage(posts=[], has_more=False, next_cursor=None)
 
     post_ids = [p.id for p in posts]
     hearted_result = await db.execute(
@@ -184,7 +203,10 @@ async def get_profile_posts(
     )
     hearted_ids = set(hearted_result.scalars().all())
 
-    return [format_profile_post(p, user, has_hearted=p.id in hearted_ids) for p in posts]
+    formatted = [format_profile_post(p, user, has_hearted=p.id in hearted_ids) for p in posts]
+
+    next_cursor = posts[-1].created_at.isoformat() if has_more and posts else None
+    return ProfilePostsPage(posts=formatted, has_more=has_more, next_cursor=next_cursor)
 
 
 @router.post("/{user_id}/profile-posts", response_model=ProfilePostResponse, status_code=201)
@@ -328,11 +350,16 @@ class ProfilePostCommentResponse(BaseModel):
     author_display_name: str | None
     author_avatar_url: str | None
     content: str
+    parent_id: str | None
+    heart_count: int = 0
+    has_hearted: bool = False
     created_at: str
+    replies: list["ProfilePostCommentResponse"] = []
 
 
 class CreateProfilePostCommentRequest(BaseModel):
     content: str
+    parent_id: str | None = None
 
     @field_validator("content")
     @classmethod
@@ -345,7 +372,11 @@ class CreateProfilePostCommentRequest(BaseModel):
         return v
 
 
-def format_profile_post_comment(comment: ProfilePostComment, author: User) -> ProfilePostCommentResponse:
+def format_profile_post_comment(
+    comment: ProfilePostComment,
+    author: User,
+    has_hearted: bool = False,
+) -> ProfilePostCommentResponse:
     return ProfilePostCommentResponse(
         id=str(comment.id),
         author_id=str(author.id),
@@ -353,6 +384,9 @@ def format_profile_post_comment(comment: ProfilePostComment, author: User) -> Pr
         author_display_name=author.display_name,
         author_avatar_url=author.avatar_url,
         content=comment.content,
+        parent_id=str(comment.parent_id) if comment.parent_id else None,
+        heart_count=comment.heart_count,
+        has_hearted=has_hearted,
         created_at=comment.created_at.isoformat(),
     )
 
@@ -385,7 +419,34 @@ async def list_profile_post_comments(
     authors_result = await db.execute(select(User).where(User.id.in_(author_ids)))
     authors = {u.id: u for u in authors_result.scalars().all()}
 
-    return [format_profile_post_comment(c, authors[c.author_id]) for c in comments if c.author_id in authors]
+    comment_ids = [c.id for c in comments]
+    hearted_result = await db.execute(
+        select(ProfilePostCommentHeart.comment_id).where(
+            ProfilePostCommentHeart.user_id == current_user.id,
+            ProfilePostCommentHeart.comment_id.in_(comment_ids),
+        )
+    )
+    hearted_ids = set(hearted_result.scalars().all())
+
+    formatted = {
+        str(c.id): format_profile_post_comment(c, authors[c.author_id], has_hearted=c.id in hearted_ids)
+        for c in comments
+        if c.author_id in authors
+    }
+
+    top_level: list[ProfilePostCommentResponse] = []
+    for c in comments:
+        fc = formatted.get(str(c.id))
+        if not fc:
+            continue
+        if c.parent_id is None:
+            top_level.append(fc)
+        else:
+            parent = formatted.get(str(c.parent_id))
+            if parent:
+                parent.replies.append(fc)
+
+    return top_level
 
 
 @router.post("/profile-posts/{post_id}/comments", response_model=ProfilePostCommentResponse, status_code=201)
@@ -401,8 +462,26 @@ async def add_profile_post_comment(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
+    parent = None
+    parent_id = None
+    if data.parent_id:
+        try:
+            parent_id = uuid.UUID(data.parent_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+        parent_result = await db.execute(
+            select(ProfilePostComment).where(
+                ProfilePostComment.id == parent_id,
+                ProfilePostComment.post_id == pid,
+            )
+        )
+        parent = parent_result.scalar_one_or_none()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+
     comment = ProfilePostComment(
         post_id=pid,
+        parent_id=parent_id,
         author_id=current_user.id,
         content=data.content,
     )
@@ -410,6 +489,17 @@ async def add_profile_post_comment(
     post.comment_count += 1
     await db.flush()
     await db.refresh(comment)
+
+    if parent and parent.author_id != current_user.id and parent.author_id != post.author_id:
+        await create_notification(
+            db,
+            parent.author_id,
+            type="comment_reply",
+            reference_id=post.id,
+            reference_type="profile_post",
+            actor_id=current_user.id,
+        )
+
     return format_profile_post_comment(comment, current_user)
 
 
@@ -442,6 +532,64 @@ async def delete_profile_post_comment(
 
     await db.delete(comment)
     await db.flush()
+
+
+@router.post("/profile-posts/{post_id}/comments/{comment_id}/heart", status_code=200)
+async def toggle_profile_post_comment_heart(
+    post_id: str,
+    comment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Toggle heart on a profile post comment (also used by connections feed)."""
+    pid = parse_uuid(post_id)
+    cid = parse_uuid(comment_id)
+
+    # Ensure post exists
+    post_result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
+    post = post_result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    result = await db.execute(
+        select(ProfilePostComment).where(
+            ProfilePostComment.id == cid,
+            ProfilePostComment.post_id == pid,
+        )
+    )
+    comment = result.scalar_one_or_none()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    existing = await db.execute(
+        select(ProfilePostCommentHeart).where(
+            ProfilePostCommentHeart.user_id == current_user.id,
+            ProfilePostCommentHeart.comment_id == cid,
+        )
+    )
+    heart = existing.scalar_one_or_none()
+
+    if heart:
+        await db.delete(heart)
+        comment.heart_count = max(0, comment.heart_count - 1)
+        has_hearted = False
+    else:
+        db.add(ProfilePostCommentHeart(user_id=current_user.id, comment_id=cid))
+        comment.heart_count += 1
+        has_hearted = True
+
+        if comment.author_id != current_user.id:
+            await create_notification(
+                db,
+                comment.author_id,
+                type="comment_heart",
+                reference_id=comment.id,
+                reference_type="profile_post_comment",
+                actor_id=current_user.id,
+            )
+
+    await db.flush()
+    return {"heart_count": comment.heart_count, "has_hearted": has_hearted}
 
 
 # ── E2EE public key endpoints ───────────────────────────────────────────────

@@ -223,16 +223,22 @@ async def create_post(
     return format_post(post, current_user, sub.slug)
 
 
-@router.get("/subs/{slug}/posts", response_model=list[PostResponse])
+class SubPostsPage(BaseModel):
+    posts: list[PostResponse]
+    has_more: bool
+    next_cursor: str | None
+
+
+@router.get("/subs/{slug}/posts", response_model=SubPostsPage)
 async def list_sub_posts(
     slug: str,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
     limit: int = Query(default=20, le=100),
-    offset: int = Query(default=0),
+    before: str | None = Query(default=None),
     sort: str = Query(default="hot", pattern="^(hot|new)$"),
 ):
-    """Get posts in a sub. Sort by 'hot' (default) or 'new'."""
+    """Get posts in a sub. Sort by 'hot' (default) or 'new'. Cursor-paginated via `before`."""
     sub = await get_sub_by_slug(slug, db)
 
     # Private subs require membership
@@ -243,19 +249,55 @@ async def list_sub_posts(
 
     stmt = select(Post).where(Post.sub_id == sub.id, Post.is_removed == False)
     if sort == "hot":
-        stmt = stmt.order_by(Post.is_pinned.desc(), Post.heart_count.desc(), Post.created_at.desc())
+        if before is not None:
+            try:
+                stmt = stmt.where(Post.hot_score < float(before))
+            except ValueError:
+                pass
+        stmt = stmt.order_by(Post.is_pinned.desc(), Post.hot_score.desc(), Post.created_at.desc())
     else:
+        if before is not None:
+            try:
+                stmt = stmt.where(Post.created_at < datetime.fromisoformat(before))
+            except ValueError:
+                pass
         stmt = stmt.order_by(Post.is_pinned.desc(), Post.created_at.desc())
-    stmt = stmt.limit(limit).offset(offset)
 
+    stmt = stmt.limit(limit + 1)
     result = await db.execute(stmt)
-    posts = result.scalars().all()
+    posts = list(result.scalars().all())
+
+    has_more = len(posts) > limit
+    if has_more:
+        posts = posts[:limit]
 
     author_ids = list({p.author_id for p in posts})
     authors_result = await db.execute(select(User).where(User.id.in_(author_ids)))
     authors = {u.id: u for u in authors_result.scalars().all()}
 
-    return [format_post(p, authors[p.author_id], sub.slug) for p in posts if p.author_id in authors]
+    # Batch-fetch which posts the current user has hearted
+    hearted_ids: set = set()
+    if current_user and posts:
+        post_ids = [p.id for p in posts]
+        hearted_result = await db.execute(
+            select(PostHeart.post_id).where(
+                PostHeart.user_id == current_user.id,
+                PostHeart.post_id.in_(post_ids),
+            )
+        )
+        hearted_ids = {r for r in hearted_result.scalars().all()}
+
+    formatted = [
+        format_post(p, authors[p.author_id], sub.slug, has_hearted=p.id in hearted_ids)
+        for p in posts if p.author_id in authors
+    ]
+
+    last = posts[-1] if posts else None
+    next_cursor = None
+    if has_more and last:
+        next_cursor = str(last.hot_score) if sort == "hot" else last.created_at.isoformat()
+
+    return SubPostsPage(posts=formatted, has_more=has_more, next_cursor=next_cursor)
 
 
 @router.post("/posts/{post_id}/vote", status_code=200)
@@ -289,6 +331,16 @@ async def toggle_heart(
         db.add(PostHeart(user_id=current_user.id, post_id=pid))
         post.heart_count = post.heart_count + 1
         has_hearted = True
+
+        # Notify post author (not if they hearted their own post)
+        if post.author_id != current_user.id:
+            await create_notification(
+                db, post.author_id,
+                type="post_heart",
+                reference_id=post.id,
+                reference_type="post",
+                actor_id=current_user.id,
+            )
 
     post.hot_score = calc_hot_score(post.heart_count, post.created_at)
     await db.flush()
@@ -373,7 +425,13 @@ async def get_post(
         await require_membership(sub, current_user, db)
 
     author = await get_user_by_id(post.author_id, db)
-    return format_post(post, author, sub.slug if sub else "")
+    has_hearted = False
+    if current_user:
+        heart_result = await db.execute(
+            select(PostHeart).where(PostHeart.user_id == current_user.id, PostHeart.post_id == post.id)
+        )
+        has_hearted = heart_result.scalar_one_or_none() is not None
+    return format_post(post, author, sub.slug if sub else "", has_hearted=has_hearted)
 
 
 @router.patch("/posts/{post_id}", response_model=PostResponse)
@@ -623,6 +681,15 @@ async def toggle_comment_heart(
         db.add(CommentHeart(user_id=current_user.id, comment_id=cid))
         comment.heart_count += 1
         has_hearted = True
+
+        if comment.author_id != current_user.id:
+            await create_notification(
+                db, comment.author_id,
+                type="comment_heart",
+                reference_id=comment.post_id,
+                reference_type="post",
+                actor_id=current_user.id,
+            )
 
     await db.flush()
     return {"heart_count": comment.heart_count, "has_hearted": has_hearted}

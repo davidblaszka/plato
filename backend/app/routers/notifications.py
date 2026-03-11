@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.config import settings
 from app.models.user import User
+from app.models.sub import Sub
 from app.models.notification import Notification
 from app.services.notifications import manager
 
@@ -23,7 +24,11 @@ NOTIFICATION_LABELS = {
     "post_comment": "commented on your post",
     "comment_reply": "replied to your comment",
     "sub_join": "joined your sub",
+    "sub_join_request": "requested to join your sub",
+    "sub_invite": "invited you to join a circle",
     "post_upvote": "upvoted your post",
+    "post_heart": "liked your post",
+    "comment_heart": "liked your comment",
     "new_follower": "followed you",
 }
 
@@ -33,7 +38,11 @@ NOTIFICATION_ICONS = {
     "post_comment": "chat_bubble",
     "comment_reply": "reply",
     "sub_join": "group_add",
+    "sub_join_request": "person_search",
+    "sub_invite": "mail",
     "post_upvote": "arrow_upward",
+    "post_heart": "favorite",
+    "comment_heart": "favorite",
     "new_follower": "person",
 }
 
@@ -49,6 +58,7 @@ class NotificationResponse(BaseModel):
     actor_avatar_url: str | None
     reference_id: str | None
     reference_type: str | None
+    reference_slug: str | None = None   # slug for sub references
     is_read: bool
     created_at: str
 
@@ -81,6 +91,13 @@ async def list_notifications(
         actors_result = await db.execute(select(User).where(User.id.in_(actor_ids)))
         actors = {u.id: u for u in actors_result.scalars().all()}
 
+    # Batch-fetch sub slugs for sub-type notifications
+    sub_ref_ids = list({n.reference_id for n in notifs if n.reference_type == "sub" and n.reference_id})
+    sub_slugs: dict = {}
+    if sub_ref_ids:
+        subs_result = await db.execute(select(Sub).where(Sub.id.in_(sub_ref_ids)))
+        sub_slugs = {s.id: s.slug for s in subs_result.scalars().all()}
+
     return [
         NotificationResponse(
             id=str(n.id),
@@ -93,6 +110,7 @@ async def list_notifications(
             actor_avatar_url=actors[n.actor_id].avatar_url if n.actor_id and n.actor_id in actors else None,
             reference_id=str(n.reference_id) if n.reference_id else None,
             reference_type=n.reference_type,
+            reference_slug=sub_slugs.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None,
             is_read=n.is_read,
             created_at=n.created_at.isoformat(),
         )

@@ -34,6 +34,7 @@ class ConversationResponse(BaseModel):
     last_message: str | None
     last_message_at: str | None
     unread_count: int
+    created_by: str | None = None  # user_id of who initiated the conversation
 
 
 class MessageResponse(BaseModel):
@@ -239,6 +240,7 @@ async def format_conversation(
         last_message=last_message_text,
         last_message_at=last_msg.created_at.isoformat() if last_msg else None,
         unread_count=unread,
+        created_by=str(conv.created_by) if conv.created_by else None,
     )
 
 
@@ -612,6 +614,48 @@ async def send_encrypted_message(
         is_edited=False,
         created_at=msg.created_at.isoformat(),
     )
+
+
+@router.delete("/{message_id}", status_code=204)
+async def delete_message(
+    message_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a message. Only the sender can delete their own messages."""
+    import uuid as _uuid
+    try:
+        mid = _uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    result = await db.execute(select(Message).where(Message.id == mid))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot delete another user's message")
+
+    conversation_id = str(msg.conversation_id)
+    await db.delete(msg)
+    await db.flush()
+
+    # Broadcast deletion event to all other participants
+    parts_result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == msg.conversation_id
+        )
+    )
+    participants = parts_result.scalars().all()
+    payload = {
+        "type": "message_deleted",
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+    }
+    sender_id = str(current_user.id)
+    for p in participants:
+        if str(p.user_id) != sender_id:
+            await message_manager.send_to_user(str(p.user_id), payload)
 
 
 @router.get("/{conversation_id}/sync", response_model=list[MessageSyncItem])

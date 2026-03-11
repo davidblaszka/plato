@@ -1,5 +1,6 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from pydantic import BaseModel
@@ -147,13 +148,22 @@ class PublicFeedPost(BaseModel):
     media_urls: list[str]
     heart_count: int
     has_hearted: bool
+    comment_count: int = 0
     is_edited: bool
     created_at: str
 
 
-@router.get("/feed", response_model=list[PublicFeedPost])
+class PublicFeedPage(BaseModel):
+    posts: list[PublicFeedPost]
+    has_more: bool
+    next_cursor: str | None
+
+
+@router.get("/feed", response_model=PublicFeedPage)
 async def get_public_feed(
     sort: str = "hot",
+    before: str | None = Query(default=None),
+    limit: int = Query(default=20, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -166,7 +176,7 @@ async def get_public_feed(
     followed_ids = [row[0] for row in follows_result.all()]
 
     if not followed_ids:
-        return []
+        return PublicFeedPage(posts=[], has_more=False, next_cursor=None)
 
     stmt = (
         select(ProfilePost, User)
@@ -175,16 +185,30 @@ async def get_public_feed(
     )
 
     if sort == "hot":
-        stmt = stmt.order_by(ProfilePost.heart_count.desc(), ProfilePost.created_at.desc())
+        if before is not None:
+            try:
+                stmt = stmt.where(ProfilePost.hot_score < float(before))
+            except ValueError:
+                pass
+        stmt = stmt.order_by(ProfilePost.hot_score.desc(), ProfilePost.created_at.desc())
     else:
+        if before is not None:
+            try:
+                stmt = stmt.where(ProfilePost.created_at < datetime.fromisoformat(before))
+            except ValueError:
+                pass
         stmt = stmt.order_by(ProfilePost.created_at.desc())
 
-    stmt = stmt.limit(100)
+    stmt = stmt.limit(limit + 1)
     result = await db.execute(stmt)
-    rows = result.all()
+    rows = list(result.all())
+
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
 
     if not rows:
-        return []
+        return PublicFeedPage(posts=[], has_more=False, next_cursor=None)
 
     post_ids = [p.id for p, u in rows]
     hearted_result = await db.execute(
@@ -195,7 +219,7 @@ async def get_public_feed(
     )
     hearted_ids = set(hearted_result.scalars().all())
 
-    return [
+    formatted = [
         PublicFeedPost(
             id=str(p.id),
             author_id=str(u.id),
@@ -207,8 +231,16 @@ async def get_public_feed(
             media_urls=p.media_urls or [],
             heart_count=p.heart_count,
             has_hearted=p.id in hearted_ids,
+            comment_count=p.comment_count,
             is_edited=p.is_edited,
             created_at=p.created_at.isoformat(),
         )
         for p, u in rows
     ]
+
+    last_post = rows[-1][0] if rows else None
+    next_cursor = None
+    if has_more and last_post:
+        next_cursor = str(last_post.hot_score) if sort == "hot" else last_post.created_at.isoformat()
+
+    return PublicFeedPage(posts=formatted, has_more=has_more, next_cursor=next_cursor)

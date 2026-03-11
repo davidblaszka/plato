@@ -8,7 +8,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.sub import Sub, SubMembership
+from app.models.sub import Sub, SubMembership, SubInvite
 from app.services.notifications import create_notification
 
 router = APIRouter(prefix="/subs", tags=["subs"])
@@ -367,6 +367,7 @@ class UpdateSubRequest(BaseModel):
     description: str | None = None
     sub_type: str | None = None
     join_policy: str | None = None
+    avatar_url: str | None = None
 
     @field_validator("sub_type")
     @classmethod
@@ -413,6 +414,8 @@ async def update_sub(
         sub.sub_type = data.sub_type
     if data.join_policy is not None:
         sub.join_policy = data.join_policy
+    if data.avatar_url is not None:
+        sub.avatar_url = data.avatar_url or None
 
     await db.flush()
     membership = await get_membership(sub.id, current_user.id, db)
@@ -447,6 +450,16 @@ async def request_join(
     req = SubJoinRequest(sub_id=sub.id, user_id=current_user.id, status="pending")
     db.add(req)
     await db.flush()
+
+    # Notify sub owner
+    await create_notification(
+        db, sub.owner_id,
+        type="sub_join_request",
+        reference_id=sub.id,
+        reference_type="sub",
+        actor_id=current_user.id,
+    )
+
     return {"status": "pending", "request_id": str(req.id)}
 
 
@@ -549,7 +562,7 @@ async def invite_to_sub(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Directly add a user to the sub (owner only). Used for invite-only subs."""
+    """Invite a user to the sub (owner only). Creates a pending invite they must accept."""
     username = data.get("username", "").strip().lower()
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
@@ -567,11 +580,121 @@ async def invite_to_sub(
     if existing:
         raise HTTPException(status_code=409, detail="User is already a member")
 
-    membership = SubMembership(sub_id=sub.id, user_id=user.id, role="member")
+    # Check for existing pending invite
+    import uuid as _uuid
+    existing_invite = await db.execute(
+        select(SubInvite).where(
+            SubInvite.sub_id == sub.id,
+            SubInvite.user_id == user.id,
+            SubInvite.status == "pending",
+        )
+    )
+    if existing_invite.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Invite already sent")
+
+    invite = SubInvite(sub_id=sub.id, user_id=user.id, invited_by=current_user.id)
+    db.add(invite)
+    await db.flush()
+
+    # Notify the invited user
+    await create_notification(
+        db, user.id,
+        type="sub_invite",
+        reference_id=sub.id,
+        reference_type="sub",
+        actor_id=current_user.id,
+    )
+
+    return {"status": "invited", "username": username}
+
+
+@router.post("/{slug}/accept-invite", status_code=200)
+async def accept_invite(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Accept a pending sub invite. Adds user as member."""
+    sub = await get_sub_or_404(slug, db)
+
+    invite_result = await db.execute(
+        select(SubInvite).where(
+            SubInvite.sub_id == sub.id,
+            SubInvite.user_id == current_user.id,
+            SubInvite.status == "pending",
+        )
+    )
+    invite = invite_result.scalar_one_or_none()
+    if not invite:
+        raise HTTPException(status_code=404, detail="No pending invite found")
+
+    invite.status = "accepted"
+    membership = SubMembership(sub_id=sub.id, user_id=current_user.id, role="member")
     db.add(membership)
     sub.member_count += 1
     await db.flush()
-    return {"status": "added", "username": username}
+    return {"status": "joined"}
+
+
+@router.post("/{slug}/decline-invite", status_code=200)
+async def decline_invite(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Decline a pending sub invite."""
+    sub = await get_sub_or_404(slug, db)
+
+    invite_result = await db.execute(
+        select(SubInvite).where(
+            SubInvite.sub_id == sub.id,
+            SubInvite.user_id == current_user.id,
+            SubInvite.status == "pending",
+        )
+    )
+    invite = invite_result.scalar_one_or_none()
+    if not invite:
+        raise HTTPException(status_code=404, detail="No pending invite found")
+
+    invite.status = "declined"
+    await db.flush()
+    return {"status": "declined"}
+
+
+@router.delete("/{slug}/members/{user_id}", status_code=204)
+async def remove_member(
+    slug: str,
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a member from the sub. Owner only. Owner cannot remove themselves."""
+    import uuid as _uuid
+    sub = await get_sub_or_404(slug, db)
+    if sub.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Owner only")
+
+    try:
+        uid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if uid == sub.owner_id:
+        raise HTTPException(status_code=400, detail="Owner cannot be removed")
+
+    result = await db.execute(
+        select(SubMembership).where(
+            SubMembership.sub_id == sub.id,
+            SubMembership.user_id == uid,
+        )
+    )
+    membership = result.scalar_one_or_none()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    await db.delete(membership)
+    sub.member_count = max(0, sub.member_count - 1)
+    await db.flush()
 
 
 @router.get("/{slug}/my-join-request")

@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +8,9 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.connection import Connection, ConnectionPost, ConnectionPostHeart, ConnectionPostComment, ConnectionPostCommentHeart
+from app.models.connection import Connection
+from app.models.profile_post import ProfilePost, ProfilePostComment, ProfilePostCommentHeart
+from app.models.social import ProfilePostHeart
 from app.services.notifications import create_notification
 
 router = APIRouter(tags=["connections"])
@@ -35,9 +38,11 @@ class ConnectionPostCommentResponse(BaseModel):
     id: str
     author: UserSummary
     content: str
+    parent_id: str | None = None
     created_at: str
     heart_count: int = 0
     has_hearted: bool = False
+    replies: list["ConnectionPostCommentResponse"] = []
 
 
 class ConnectionPostResponse(BaseModel):
@@ -325,15 +330,19 @@ async def create_connection_post(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Post to your connections feed. Only your mutual connections will see this."""
+    """Post to your connections feed (stored as a profile post)."""
+    import math
     if not data.has_content():
         raise HTTPException(status_code=422, detail="Post must have text or at least one image")
-    post = ConnectionPost(
+    post = ProfilePost(
         author_id=current_user.id,
         content=data.content,
         media_urls=data.media_urls,
     )
     db.add(post)
+    await db.flush()
+    await db.refresh(post)
+    post.hot_score = round(math.log10(1) + post.created_at.timestamp() / 45000, 7)
     await db.flush()
     await db.refresh(post)
 
@@ -350,33 +359,45 @@ async def create_connection_post(
     )
 
 
-@router.get("/connections/feed", response_model=list[ConnectionPostResponse])
+class ConnectionsFeedPage(BaseModel):
+    posts: list[ConnectionPostResponse]
+    has_more: bool
+    next_cursor: str | None
+
+
+@router.get("/connections/feed", response_model=ConnectionsFeedPage)
 async def get_connections_feed(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(default=20, le=100),
-    offset: int = Query(default=0),
+    before: str | None = Query(default=None),
 ):
     """
     The private connections feed — posts from you and your mutual connections.
-    Chronological. No algorithm.
+    Chronological. No algorithm. Cursor-paginated via `before`.
     """
     connection_ids = await get_accepted_connection_ids(current_user.id, db)
 
     # Include your own posts in your feed
     visible_author_ids = connection_ids + [current_user.id]
 
-    result = await db.execute(
-        select(ConnectionPost)
-        .where(ConnectionPost.author_id.in_(visible_author_ids))
-        .order_by(ConnectionPost.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    posts = result.scalars().all()
+    stmt = select(ProfilePost).where(ProfilePost.author_id.in_(visible_author_ids))
+    if before is not None:
+        try:
+            stmt = stmt.where(ProfilePost.created_at < datetime.fromisoformat(before))
+        except ValueError:
+            pass
+    stmt = stmt.order_by(ProfilePost.created_at.desc()).limit(limit + 1)
+
+    result = await db.execute(stmt)
+    posts = list(result.scalars().all())
+
+    has_more = len(posts) > limit
+    if has_more:
+        posts = posts[:limit]
 
     if not posts:
-        return []
+        return ConnectionsFeedPage(posts=[], has_more=False, next_cursor=None)
 
     author_ids = list({p.author_id for p in posts})
     users_result = await db.execute(select(User).where(User.id.in_(author_ids)))
@@ -385,14 +406,14 @@ async def get_connections_feed(
     # Batch-fetch which posts the current user has hearted
     post_ids = [p.id for p in posts]
     hearted_result = await db.execute(
-        select(ConnectionPostHeart.post_id).where(
-            ConnectionPostHeart.user_id == current_user.id,
-            ConnectionPostHeart.post_id.in_(post_ids),
+        select(ProfilePostHeart.post_id).where(
+            ProfilePostHeart.user_id == current_user.id,
+            ProfilePostHeart.post_id.in_(post_ids),
         )
     )
     hearted_ids = {r for r in hearted_result.scalars().all()}
 
-    return [
+    formatted = [
         ConnectionPostResponse(
             id=str(p.id),
             author=format_user(users[p.author_id]),
@@ -408,6 +429,9 @@ async def get_connections_feed(
         if p.author_id in users
     ]
 
+    next_cursor = posts[-1].created_at.isoformat() if has_more and posts else None
+    return ConnectionsFeedPage(posts=formatted, has_more=has_more, next_cursor=next_cursor)
+
 
 @router.get("/connections/feed/posts/{post_id}", response_model=ConnectionPostResponse)
 async def get_connection_post(
@@ -422,7 +446,7 @@ async def get_connection_post(
     except ValueError:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
     post = result.scalar_one_or_none()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -436,9 +460,9 @@ async def get_connection_post(
     author = author_result.scalar_one()
 
     hearted_result = await db.execute(
-        select(ConnectionPostHeart).where(
-            ConnectionPostHeart.user_id == current_user.id,
-            ConnectionPostHeart.post_id == pid,
+        select(ProfilePostHeart).where(
+            ProfilePostHeart.user_id == current_user.id,
+            ProfilePostHeart.post_id == pid,
         )
     )
     has_hearted = hearted_result.scalar_one_or_none() is not None
@@ -469,15 +493,16 @@ async def toggle_connection_post_heart(
     except ValueError:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    import math as _math
+    result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
     post = result.scalar_one_or_none()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
     existing = await db.execute(
-        select(ConnectionPostHeart).where(
-            ConnectionPostHeart.user_id == current_user.id,
-            ConnectionPostHeart.post_id == pid,
+        select(ProfilePostHeart).where(
+            ProfilePostHeart.user_id == current_user.id,
+            ProfilePostHeart.post_id == pid,
         )
     )
     heart = existing.scalar_one_or_none()
@@ -487,10 +512,22 @@ async def toggle_connection_post_heart(
         post.heart_count = max(0, post.heart_count - 1)
         has_hearted = False
     else:
-        db.add(ConnectionPostHeart(user_id=current_user.id, post_id=pid))
+        db.add(ProfilePostHeart(user_id=current_user.id, post_id=pid))
         post.heart_count += 1
         has_hearted = True
 
+        if post.author_id != current_user.id:
+            await create_notification(
+                db, post.author_id,
+                type="post_heart",
+                reference_id=post.id,
+                reference_type="profile_post",
+                actor_id=current_user.id,
+            )
+
+    post.hot_score = round(
+        _math.log10(max(post.heart_count, 1)) + post.created_at.timestamp() / 45000, 7
+    )
     await db.flush()
     return {"heart_count": post.heart_count, "has_hearted": has_hearted}
 
@@ -502,8 +539,13 @@ async def delete_connection_post(
     current_user: User = Depends(get_current_user),
 ):
     """Delete a post from your connections feed."""
+    import uuid as _uuid
+    try:
+        pid = _uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
     result = await db.execute(
-        select(ConnectionPost).where(ConnectionPost.id == post_id)
+        select(ProfilePost).where(ProfilePost.id == pid)
     )
     post = result.scalar_one_or_none()
     if not post:
@@ -517,6 +559,7 @@ async def delete_connection_post(
 
 class CreateCommentRequest(BaseModel):
     content: str
+    parent_id: str | None = None
 
     @field_validator("content")
     @classmethod
@@ -529,13 +572,13 @@ class CreateCommentRequest(BaseModel):
         return v
 
 
-async def _get_post_or_404(post_id: str, db: AsyncSession) -> ConnectionPost:
+async def _get_post_or_404(post_id: str, db: AsyncSession) -> ProfilePost:
     import uuid as _uuid
     try:
         pid = _uuid.UUID(post_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Post not found")
-    result = await db.execute(select(ConnectionPost).where(ConnectionPost.id == pid))
+    result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
     post = result.scalar_one_or_none()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -554,9 +597,9 @@ async def list_post_comments(
     post = await _get_post_or_404(post_id, db)
 
     result = await db.execute(
-        select(ConnectionPostComment)
-        .where(ConnectionPostComment.post_id == post.id)
-        .order_by(ConnectionPostComment.created_at.asc())
+        select(ProfilePostComment)
+        .where(ProfilePostComment.post_id == post.id)
+        .order_by(ProfilePostComment.created_at.asc())
         .limit(limit)
         .offset(offset)
     )
@@ -571,25 +614,40 @@ async def list_post_comments(
 
     comment_ids = [c.id for c in comments]
     hearted_result = await db.execute(
-        select(ConnectionPostCommentHeart.comment_id).where(
-            ConnectionPostCommentHeart.user_id == current_user.id,
-            ConnectionPostCommentHeart.comment_id.in_(comment_ids),
+        select(ProfilePostCommentHeart.comment_id).where(
+            ProfilePostCommentHeart.user_id == current_user.id,
+            ProfilePostCommentHeart.comment_id.in_(comment_ids),
         )
     )
     hearted_ids = set(hearted_result.scalars().all())
 
-    return [
-        ConnectionPostCommentResponse(
+    formatted = {
+        str(c.id): ConnectionPostCommentResponse(
             id=str(c.id),
             author=format_user(users[c.author_id]),
             content=c.content,
+            parent_id=str(c.parent_id) if c.parent_id else None,
             created_at=c.created_at.isoformat(),
             heart_count=c.heart_count,
             has_hearted=c.id in hearted_ids,
         )
         for c in comments
         if c.author_id in users
-    ]
+    }
+
+    top_level: list[ConnectionPostCommentResponse] = []
+    for c in comments:
+        fc = formatted.get(str(c.id))
+        if not fc:
+            continue
+        if c.parent_id is None:
+            top_level.append(fc)
+        else:
+            parent = formatted.get(str(c.parent_id))
+            if parent:
+                parent.replies.append(fc)
+
+    return top_level
 
 
 @router.post("/connections/feed/posts/{post_id}/comments", response_model=ConnectionPostCommentResponse, status_code=201)
@@ -600,10 +658,29 @@ async def add_post_comment(
     current_user: User = Depends(get_current_user),
 ):
     """Add a comment to a connection feed post."""
+    import uuid as _uuid
     post = await _get_post_or_404(post_id, db)
 
-    comment = ConnectionPostComment(
+    parent = None
+    parent_id = None
+    if data.parent_id:
+        try:
+            parent_id = _uuid.UUID(data.parent_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+        parent_result = await db.execute(
+            select(ProfilePostComment).where(
+                ProfilePostComment.id == parent_id,
+                ProfilePostComment.post_id == post.id,
+            )
+        )
+        parent = parent_result.scalar_one_or_none()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+
+    comment = ProfilePostComment(
         post_id=post.id,
+        parent_id=parent_id,
         author_id=current_user.id,
         content=data.content,
     )
@@ -612,11 +689,32 @@ async def add_post_comment(
     await db.flush()
     await db.refresh(comment)
 
+    if post.author_id != current_user.id:
+        await create_notification(
+            db, post.author_id,
+            type="post_comment",
+            reference_id=post.id,
+            reference_type="profile_post",
+            actor_id=current_user.id,
+        )
+
+    if parent and parent.author_id != current_user.id and parent.author_id != post.author_id:
+        await create_notification(
+            db, parent.author_id,
+            type="comment_reply",
+            reference_id=post.id,
+            reference_type="profile_post",
+            actor_id=current_user.id,
+        )
+
     return ConnectionPostCommentResponse(
         id=str(comment.id),
         author=format_user(current_user),
         content=comment.content,
+        parent_id=str(comment.parent_id) if comment.parent_id else None,
         created_at=comment.created_at.isoformat(),
+        heart_count=comment.heart_count,
+        has_hearted=False,
     )
 
 
@@ -637,9 +735,9 @@ async def delete_post_comment(
     post = await _get_post_or_404(post_id, db)
 
     result = await db.execute(
-        select(ConnectionPostComment).where(
-            ConnectionPostComment.id == cid,
-            ConnectionPostComment.post_id == post.id,
+        select(ProfilePostComment).where(
+            ProfilePostComment.id == cid,
+            ProfilePostComment.post_id == post.id,
         )
     )
     comment = result.scalar_one_or_none()
@@ -670,9 +768,9 @@ async def toggle_connection_comment_heart(
     post = await _get_post_or_404(post_id, db)
 
     result = await db.execute(
-        select(ConnectionPostComment).where(
-            ConnectionPostComment.id == cid,
-            ConnectionPostComment.post_id == post.id,
+        select(ProfilePostComment).where(
+            ProfilePostComment.id == cid,
+            ProfilePostComment.post_id == post.id,
         )
     )
     comment = result.scalar_one_or_none()
@@ -680,9 +778,9 @@ async def toggle_connection_comment_heart(
         raise HTTPException(status_code=404, detail="Comment not found")
 
     existing = await db.execute(
-        select(ConnectionPostCommentHeart).where(
-            ConnectionPostCommentHeart.user_id == current_user.id,
-            ConnectionPostCommentHeart.comment_id == cid,
+        select(ProfilePostCommentHeart).where(
+            ProfilePostCommentHeart.user_id == current_user.id,
+            ProfilePostCommentHeart.comment_id == cid,
         )
     )
     heart = existing.scalar_one_or_none()
@@ -692,9 +790,19 @@ async def toggle_connection_comment_heart(
         comment.heart_count = max(0, comment.heart_count - 1)
         has_hearted = False
     else:
-        db.add(ConnectionPostCommentHeart(user_id=current_user.id, comment_id=cid))
+        db.add(ProfilePostCommentHeart(user_id=current_user.id, comment_id=cid))
         comment.heart_count += 1
         has_hearted = True
+
+        if comment.author_id != current_user.id:
+            await create_notification(
+                db,
+                comment.author_id,
+                type="comment_heart",
+                reference_id=comment.id,
+                reference_type="profile_post_comment",
+                actor_id=current_user.id,
+            )
 
     await db.flush()
     return {"heart_count": comment.heart_count, "has_hearted": has_hearted}
