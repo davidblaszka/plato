@@ -35,6 +35,8 @@ class ConversationResponse(BaseModel):
     last_message_at: str | None
     unread_count: int
     created_by: str | None = None  # user_id of who initiated the conversation
+    is_request: bool = False        # True when conversation is a pending request
+    initiated_by: str | None = None  # user_id of initiator when is_request=True
 
 
 class MessageResponse(BaseModel):
@@ -270,6 +272,7 @@ async def format_conversation(
         else:
             last_message_text = decrypt_message(last_msg.content_encrypted)
 
+    is_request = conv.status == 'request'
     return ConversationResponse(
         id=str(conv.id),
         type=conv.type,
@@ -280,6 +283,8 @@ async def format_conversation(
         last_message_at=last_msg.created_at.isoformat() if last_msg else None,
         unread_count=unread,
         created_by=str(conv.created_by) if conv.created_by else None,
+        is_request=is_request,
+        initiated_by=str(conv.created_by) if is_request and conv.created_by else None,
     )
 
 
@@ -413,14 +418,35 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List conversations. status=active (default), request, or all."""
+    """List conversations. status=active (default), request, or all.
+
+    active  — returns active conversations + outgoing pending requests
+    request — returns only incoming pending requests (not initiated by current user)
+    all     — returns everything
+    """
     stmt = (
         select(Conversation)
         .join(ConversationParticipant, Conversation.id == ConversationParticipant.conversation_id)
         .where(ConversationParticipant.user_id == current_user.id)
     )
-    if status != "all":
-        stmt = stmt.where(Conversation.status == status)
+    if status == "active":
+        stmt = stmt.where(
+            or_(
+                Conversation.status == "active",
+                and_(
+                    Conversation.status == "request",
+                    Conversation.created_by == current_user.id,
+                ),
+            )
+        )
+    elif status == "request":
+        stmt = stmt.where(
+            and_(
+                Conversation.status == "request",
+                Conversation.created_by != current_user.id,
+            )
+        )
+    # status == "all": no additional filter
     stmt = stmt.order_by(Conversation.updated_at.desc())
 
     result = await db.execute(stmt)
@@ -477,6 +503,33 @@ async def decline_message_request(
 
     if conv.created_by == current_user.id:
         raise HTTPException(status_code=403, detail="Cannot decline your own message")
+
+    await db.delete(conv)
+
+
+@router.delete("/{conversation_id}/cancel", status_code=204)
+async def cancel_message_request(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel a pending message request the current user initiated."""
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await db.execute(select(Conversation).where(Conversation.id == cid))
+    conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if conv.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot cancel another user's request")
+
+    if conv.status != "request":
+        raise HTTPException(status_code=400, detail="Conversation is already active")
 
     await db.delete(conv)
 

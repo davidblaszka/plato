@@ -88,7 +88,8 @@ async def get_home_feed(
     hearted_ids = {r for r in hearted_result.scalars().all()}
 
     formatted = [
-        format_post(p, authors[p.author_id], subs[p.sub_id].slug, has_hearted=p.id in hearted_ids)
+        format_post(p, authors[p.author_id], subs[p.sub_id].slug, has_hearted=p.id in hearted_ids,
+                    sub_name=subs[p.sub_id].name, sub_avatar_url=subs[p.sub_id].avatar_url)
         for p in posts
         if p.author_id in authors and p.sub_id in subs
     ]

@@ -92,6 +92,8 @@ class PostResponse(BaseModel):
     id: str
     sub_id: str
     sub_slug: str
+    sub_name: str = ''
+    sub_avatar_url: str | None = None
     author: AuthorInfo
     content: str | None
     media_urls: list[str]
@@ -149,11 +151,20 @@ async def get_user_by_id(user_id, db: AsyncSession) -> User:
     return result.scalar_one_or_none()
 
 
-def format_post(post: Post, author: User, sub_slug: str, has_hearted: bool = False) -> PostResponse:
+def format_post(
+    post: Post,
+    author: User,
+    sub_slug: str,
+    has_hearted: bool = False,
+    sub_name: str = '',
+    sub_avatar_url: str | None = None,
+) -> PostResponse:
     return PostResponse(
         id=str(post.id),
         sub_id=str(post.sub_id),
         sub_slug=sub_slug,
+        sub_name=sub_name,
+        sub_avatar_url=sub_avatar_url,
         author=AuthorInfo(
             user_id=str(author.id),
             username=author.username,
@@ -220,7 +231,7 @@ async def create_post(
     post.hot_score = calc_hot_score(0, post.created_at)
     await db.flush()
     await db.refresh(post)
-    return format_post(post, current_user, sub.slug)
+    return format_post(post, current_user, sub.slug, sub_name=sub.name, sub_avatar_url=sub.avatar_url)
 
 
 class SubPostsPage(BaseModel):
@@ -288,7 +299,8 @@ async def list_sub_posts(
         hearted_ids = {r for r in hearted_result.scalars().all()}
 
     formatted = [
-        format_post(p, authors[p.author_id], sub.slug, has_hearted=p.id in hearted_ids)
+        format_post(p, authors[p.author_id], sub.slug, has_hearted=p.id in hearted_ids,
+                    sub_name=sub.name, sub_avatar_url=sub.avatar_url)
         for p in posts if p.author_id in authors
     ]
 
@@ -431,7 +443,8 @@ async def get_post(
             select(PostHeart).where(PostHeart.user_id == current_user.id, PostHeart.post_id == post.id)
         )
         has_hearted = heart_result.scalar_one_or_none() is not None
-    return format_post(post, author, sub.slug if sub else "", has_hearted=has_hearted)
+    return format_post(post, author, sub.slug if sub else "", has_hearted=has_hearted,
+                       sub_name=sub.name if sub else '', sub_avatar_url=sub.avatar_url if sub else None)
 
 
 @router.patch("/posts/{post_id}", response_model=PostResponse)
@@ -452,7 +465,7 @@ async def update_post(
 
     sub_result = await db.execute(select(Sub).where(Sub.id == post.sub_id))
     sub = sub_result.scalar_one()
-    return format_post(post, current_user, sub.slug)
+    return format_post(post, current_user, sub.slug, sub_name=sub.name, sub_avatar_url=sub.avatar_url)
 
 
 @router.delete("/posts/{post_id}", status_code=204)
