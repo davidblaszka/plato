@@ -59,6 +59,9 @@ class SubResponse(BaseModel):
     # Viewer-specific fields (None if not authenticated)
     is_member: bool = False
     member_role: str | None = None
+    # Precise relationship status for the viewing user:
+    # none | invited | pending | member | moderator | owner
+    membership_status: str = "none"
 
 
 class MemberResponse(BaseModel):
@@ -100,7 +103,13 @@ async def get_membership(
     return result.scalar_one_or_none()
 
 
-def format_sub(sub: Sub, membership: SubMembership | None = None) -> SubResponse:
+def format_sub(
+    sub: Sub,
+    membership: SubMembership | None = None,
+    membership_status: str | None = None,
+) -> SubResponse:
+    if membership_status is None:
+        membership_status = membership.role if membership else "none"
     return SubResponse(
         id=str(sub.id),
         name=sub.name,
@@ -114,6 +123,7 @@ def format_sub(sub: Sub, membership: SubMembership | None = None) -> SubResponse
         created_at=sub.created_at.isoformat(),
         is_member=membership is not None,
         member_role=membership.role if membership else None,
+        membership_status=membership_status,
     )
 
 
@@ -222,20 +232,47 @@ async def get_sub(
     current_user: Optional[User] = Depends(get_current_user),
 ):
     """Get a single sub by slug. Private subs require membership."""
+    from app.models.sub import SubJoinRequest
+
     sub = await get_sub_or_404(slug, db)
 
     membership = None
+    membership_status = "none"
     if current_user:
         membership = await get_membership(sub.id, current_user.id, db)
+        if membership:
+            membership_status = membership.role  # member | moderator | owner
+        else:
+            # Check for a pending invite
+            invite_result = await db.execute(
+                select(SubInvite).where(
+                    SubInvite.sub_id == sub.id,
+                    SubInvite.user_id == current_user.id,
+                    SubInvite.status == "pending",
+                )
+            )
+            if invite_result.scalar_one_or_none():
+                membership_status = "invited"
+            else:
+                # Check for a pending join request
+                req_result = await db.execute(
+                    select(SubJoinRequest).where(
+                        SubJoinRequest.sub_id == sub.id,
+                        SubJoinRequest.user_id == current_user.id,
+                        SubJoinRequest.status == "pending",
+                    )
+                )
+                if req_result.scalar_one_or_none():
+                    membership_status = "pending"
 
     if sub.sub_type == "private" and not membership:
-        if sub.join_policy == "invite":
+        if sub.join_policy == "invite" and membership_status != "invited":
             raise HTTPException(
                 status_code=403, detail="This sub requires an invitation to join."
             )
         # Private approval sub — allow viewing so user can request to join
 
-    return format_sub(sub, membership)
+    return format_sub(sub, membership, membership_status=membership_status)
 
 
 @router.post("/{slug}/join", response_model=SubResponse)

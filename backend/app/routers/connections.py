@@ -677,6 +677,8 @@ async def add_post_comment(
         parent = parent_result.scalar_one_or_none()
         if not parent:
             raise HTTPException(status_code=404, detail="Parent comment not found")
+        if parent.parent_id is not None:
+            raise HTTPException(status_code=400, detail="Replies can only be one level deep")
 
     comment = ProfilePostComment(
         post_id=post.id,
