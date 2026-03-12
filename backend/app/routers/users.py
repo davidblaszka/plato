@@ -280,6 +280,16 @@ async def send_connection_request(
     conn = Connection(requester_id=current_user.id, addressee_id=uid, status="pending")
     db.add(conn)
     await db.flush()
+
+    # Notify the recipient
+    await create_notification(
+        db, uid,
+        type="connection_request",
+        reference_id=conn.id,
+        reference_type="connection",
+        actor_id=current_user.id,
+    )
+
     return {"status": "pending"}
 
 
