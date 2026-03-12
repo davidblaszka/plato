@@ -41,7 +41,10 @@ async def get_home_feed(
     if not sub_ids:
         return FeedPage(posts=[], has_more=False, next_cursor=None)
 
-    stmt = select(Post).where(Post.sub_id.in_(sub_ids))
+    stmt = select(Post).where(
+        Post.sub_id.in_(sub_ids),
+        Post.is_removed == False,
+    )
     if sort == "hot":
         if before is not None:
             try:
