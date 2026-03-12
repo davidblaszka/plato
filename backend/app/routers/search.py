@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
-from pydantic import BaseModel
+from sqlalchemy import select, or_, and_
 
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -12,144 +11,133 @@ from app.models.post import Post
 router = APIRouter(prefix="/search", tags=["search"])
 
 
-class UserResult(BaseModel):
-    id: str
-    username: str
-    display_name: str | None
-    bio: str | None
-    avatar_url: str | None
-    account_type: str
-    is_verified: bool
+def _score_user(user: User, term: str) -> float:
+    score = 0.0
+    username = user.username.lower()
+    display = (user.display_name or "").lower()
+    if username == term or display == term:
+        score += 100
+    if username.startswith(term) or display.startswith(term):
+        score += 50
+    if term in username or term in display:
+        score += 20
+    if user.account_type == "public":
+        score += 5  # slight boost; no follower_count field
+    return score
 
 
-class SubResult(BaseModel):
-    id: str
-    name: str
-    slug: str
-    description: str | None
-    avatar_url: str | None
-    sub_type: str
-    member_count: int
+def _score_sub(sub: Sub, term: str) -> float:
+    score = 0.0
+    name = sub.name.lower()
+    if name == term:
+        score += 100
+    if name.startswith(term):
+        score += 50
+    if term in name:
+        score += 20
+    score += min(sub.member_count or 0, 1000) * 0.005
+    return score
 
 
-class PostResult(BaseModel):
-    id: str
-    content: str | None
-    sub_slug: str
-    author_username: str
-    author_display_name: str | None
-    author_avatar_url: str | None
-    heart_count: int
-    comment_count: int
-    created_at: str
+def _score_post(post: Post, term: str) -> float:
+    score = 0.0
+    content = (post.content or "").lower()
+    if content.startswith(term):
+        score += 30
+    score += (post.hot_score or 0) * 0.1
+    score += min(post.heart_count or 0, 100) * 0.1
+    return score
 
 
-class SearchResults(BaseModel):
-    users: list[UserResult]
-    subs: list[SubResult]
-    posts: list[PostResult]
-    query: str
-
-
-@router.get("", response_model=SearchResults)
+@router.get("")
 async def search(
     q: str = Query(..., min_length=1, max_length=100),
-    type: str = Query("all", pattern="^(all|users|subs|posts)$"),
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(20, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = q.strip()
-    pattern = f"%{q}%"
+    term = q.strip().lower()
+    if len(term) < 2:
+        return {"results": []}
 
-    users: list[UserResult] = []
-    subs: list[SubResult] = []
-    posts: list[PostResult] = []
+    pattern = f"%{term}%"
+    results = []
 
-    if type in ("all", "users"):
-        result = await db.execute(
-            select(User)
-            .where(
-                User.is_active == True,
-                or_(
-                    User.username.ilike(pattern),
-                    User.display_name.ilike(pattern),
-                )
-            )
-            .order_by(
-                # Public accounts first, then by username
-                User.account_type.desc(),
-                User.username
-            )
-            .limit(limit)
+    # ── Users ────────────────────────────────────────────────────────────────
+    user_rows = await db.execute(
+        select(User)
+        .where(
+            User.is_active == True,
+            or_(
+                User.username.ilike(pattern),
+                User.display_name.ilike(pattern),
+            ),
         )
-        users = [
-            UserResult(
-                id=str(u.id),
-                username=u.username,
-                display_name=u.display_name,
-                bio=u.bio,
-                avatar_url=u.avatar_url,
-                account_type=u.account_type,
-                is_verified=u.is_verified,
-            )
-            for u in result.scalars().all()
-        ]
+        .limit(5)
+    )
+    for user in user_rows.scalars().all():
+        results.append({
+            "type": "user",
+            "id": str(user.id),
+            "title": user.display_name or user.username,
+            "subtitle": f"@{user.username}",
+            "avatar_url": user.avatar_url,
+            "is_verified": user.is_verified,
+            "score": _score_user(user, term),
+            "route": f"/profile/{user.id}",
+        })
 
-    if type in ("all", "subs"):
-        result = await db.execute(
-            select(Sub)
-            .where(
-                or_(
-                    Sub.name.ilike(pattern),
-                    Sub.description.ilike(pattern),
-                    Sub.slug.ilike(pattern),
-                )
-            )
-            .order_by(Sub.member_count.desc())
-            .limit(limit)
+    # ── Circles (public only) ─────────────────────────────────────────────────
+    sub_rows = await db.execute(
+        select(Sub)
+        .where(
+            Sub.sub_type == "public",
+            or_(
+                Sub.name.ilike(pattern),
+                Sub.slug.ilike(pattern),
+                Sub.description.ilike(pattern),
+            ),
         )
-        subs = [
-            SubResult(
-                id=str(s.id),
-                name=s.name,
-                slug=s.slug,
-                description=s.description,
-                avatar_url=s.avatar_url,
-                sub_type=s.sub_type,
-                member_count=s.member_count,
-            )
-            for s in result.scalars().all()
-        ]
+        .limit(5)
+    )
+    for sub in sub_rows.scalars().all():
+        results.append({
+            "type": "circle",
+            "id": str(sub.id),
+            "title": sub.name,
+            "subtitle": f"{sub.member_count} members",
+            "avatar_url": sub.avatar_url,
+            "score": _score_sub(sub, term),
+            "route": f"/subs/{sub.slug}",
+        })
 
-    if type in ("all", "posts"):
-        # Join posts with users and subs for context
-        from app.models.sub import Sub as SubModel
-        stmt = (
-            select(Post, User, SubModel)
-            .join(User, Post.author_id == User.id)
-            .join(SubModel, Post.sub_id == SubModel.id)
-            .where(
-                Post.is_removed == False,
-                Post.content.ilike(pattern),
-            )
-            .order_by(Post.heart_count.desc(), Post.created_at.desc())
-            .limit(limit)
+    # ── Posts (public circles + public-account profile posts) ────────────────
+    post_rows = await db.execute(
+        select(Post, User, Sub)
+        .join(User, Post.author_id == User.id)
+        .outerjoin(Sub, Post.sub_id == Sub.id)
+        .where(
+            Post.is_removed == False,
+            Post.content.ilike(pattern),
+            or_(
+                and_(Post.sub_id.is_not(None), Sub.sub_type == "public"),
+                and_(Post.sub_id.is_(None), User.account_type == "public"),
+            ),
         )
-        result = await db.execute(stmt)
-        posts = [
-            PostResult(
-                id=str(p.id),
-                content=p.content,
-                sub_slug=s.slug,
-                author_username=u.username,
-                author_display_name=u.display_name,
-                author_avatar_url=u.avatar_url,
-                heart_count=p.heart_count,
-                comment_count=p.comment_count,
-                created_at=p.created_at.isoformat(),
-            )
-            for p, u, s in result.all()
-        ]
+        .order_by(Post.hot_score.desc())
+        .limit(10)
+    )
+    for post, user, sub in post_rows.all():
+        context = f" in {sub.name}" if sub else ""
+        results.append({
+            "type": "post",
+            "id": str(post.id),
+            "title": (post.content or "")[:120],
+            "subtitle": f"@{user.username}{context}",
+            "avatar_url": user.avatar_url,
+            "score": _score_post(post, term),
+            "route": f"/posts/{post.id}",
+        })
 
-    return SearchResults(users=users, subs=subs, posts=posts, query=q)
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return {"results": results[:limit]}
