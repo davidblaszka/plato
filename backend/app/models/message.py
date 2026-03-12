@@ -45,6 +45,9 @@ class ConversationParticipant(Base):
     last_read_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         UniqueConstraint("conversation_id", "user_id", name="uq_conversation_participant"),

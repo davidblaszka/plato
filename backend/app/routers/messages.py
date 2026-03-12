@@ -141,6 +141,10 @@ class DeleteEncryptedMessageRequest(BaseModel):
     client_id: str
 
 
+class UpdateConversationRequest(BaseModel):
+    title: str | None = None
+
+
 class EditMessageRequest(BaseModel):
     content: str
     is_encrypted: bool = False  # True = content is E2EE ciphertext; relay as-is
@@ -210,6 +214,7 @@ async def require_participant(conversation_id, user_id, db: AsyncSession):
             and_(
                 ConversationParticipant.conversation_id == conversation_id,
                 ConversationParticipant.user_id == user_id,
+                ConversationParticipant.deleted_at.is_(None),
             )
         )
     )
@@ -355,12 +360,19 @@ async def create_direct(
     for uid in [current_user.id, other.id]:
         db.add(ConversationParticipant(conversation_id=conv.id, user_id=uid))
 
-    stored = data.message if data.is_encrypted else encrypt_message(data.message)
+    # Request messages are always Fernet-encrypted (not E2EE) so the recipient
+    # can read the preview before accepting — key exchange hasn't happened yet.
+    if conv_status == "request":
+        stored = encrypt_message(data.message)
+        is_enc = False
+    else:
+        stored = data.message if data.is_encrypted else encrypt_message(data.message)
+        is_enc = data.is_encrypted
     msg = Message(
         conversation_id=conv.id,
         sender_id=current_user.id,
         content_encrypted=stored,
-        is_encrypted=data.is_encrypted,
+        is_encrypted=is_enc,
     )
     db.add(msg)
     await db.flush()
@@ -427,7 +439,10 @@ async def list_conversations(
     stmt = (
         select(Conversation)
         .join(ConversationParticipant, Conversation.id == ConversationParticipant.conversation_id)
-        .where(ConversationParticipant.user_id == current_user.id)
+        .where(
+            ConversationParticipant.user_id == current_user.id,
+            ConversationParticipant.deleted_at.is_(None),
+        )
     )
     if status == "active":
         stmt = stmt.where(
@@ -532,6 +547,112 @@ async def cancel_message_request(
         raise HTTPException(status_code=400, detail="Conversation is already active")
 
     await db.delete(conv)
+
+
+@router.patch("/{conversation_id}", response_model=ConversationResponse)
+async def update_conversation(
+    conversation_id: str,
+    data: UpdateConversationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rename a group conversation. Any participant can update the title."""
+    import uuid as _uuid
+    try:
+        cid = _uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await db.execute(select(Conversation).where(Conversation.id == cid))
+    conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    await require_participant(conversation_id, current_user.id, db)
+
+    if data.title is not None:
+        conv.name = data.title.strip() or conv.name
+    await db.flush()
+    return await format_conversation(conv, current_user.id, db)
+
+
+@router.delete("/{conversation_id}", status_code=204)
+async def delete_or_leave_conversation(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete (1:1) or leave (group) a conversation.
+
+    1:1  — soft-deletes the current user's participant row so the other
+           person's conversation is unaffected.
+    Group — removes the current user from participants entirely.
+           If nobody remains, the conversation is hard-deleted.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    try:
+        cid = _uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await db.execute(select(Conversation).where(Conversation.id == cid))
+    conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Find participant record — include soft-deleted so we can return a clean error
+    p_result = await db.execute(
+        select(ConversationParticipant).where(
+            and_(
+                ConversationParticipant.conversation_id == cid,
+                ConversationParticipant.user_id == current_user.id,
+            )
+        )
+    )
+    participant = p_result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    if conv.type == "direct":
+        # Soft-delete: hide from inbox, leave the other person's view intact
+        participant.deleted_at = datetime.now(timezone.utc)
+        await db.flush()
+    else:
+        # Group: hard-remove from participants
+        await db.delete(participant)
+        await db.flush()
+
+        # Hard-delete the conversation if nobody is left
+        remaining = await db.execute(
+            select(func.count()).where(
+                and_(
+                    ConversationParticipant.conversation_id == cid,
+                    ConversationParticipant.deleted_at.is_(None),
+                )
+            )
+        )
+        if (remaining.scalar() or 0) == 0:
+            await db.delete(conv)
+            await db.flush()
+        else:
+            # Notify remaining participants
+            payload = {
+                "type": "participant_left",
+                "conversation_id": str(conversation_id),
+                "user_id": str(current_user.id),
+                "username": current_user.username,
+            }
+            parts_result = await db.execute(
+                select(ConversationParticipant).where(
+                    and_(
+                        ConversationParticipant.conversation_id == cid,
+                        ConversationParticipant.deleted_at.is_(None),
+                    )
+                )
+            )
+            for p in parts_result.scalars().all():
+                await message_manager.send_to_user(str(p.user_id), payload)
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
