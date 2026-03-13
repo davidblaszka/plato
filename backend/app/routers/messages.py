@@ -326,13 +326,49 @@ async def create_direct(
         parts = await get_participants(conv.id, db)
         part_ids = {p.id for p in parts}
         if other.id in part_ids and len(parts) == 2:
+            # Conversation exists — revive soft-deleted participants if needed.
+            part_rows = await db.execute(
+                select(ConversationParticipant).where(
+                    and_(
+                        ConversationParticipant.conversation_id == conv.id,
+                        ConversationParticipant.user_id.in_([current_user.id, other.id]),
+                    )
+                )
+            )
+            for p in part_rows.scalars().all():
+                if p.deleted_at is not None:
+                    p.deleted_at = None
+
+            # Refresh conversation status based on connection state.
+            from app.models.connection import Connection
+            connection_result = await db.execute(
+                select(Connection).where(
+                    or_(
+                        and_(Connection.requester_id == current_user.id, Connection.addressee_id == other.id),
+                        and_(Connection.requester_id == other.id, Connection.addressee_id == current_user.id),
+                    ),
+                    Connection.status == "accepted",
+                )
+            )
+            is_connection = connection_result.scalar_one_or_none() is not None
+            conv.status = "active" if is_connection else "request"
+            if conv.status == "request":
+                conv.created_by = current_user.id
+
+            await db.flush()
+
             # Conversation exists — just send the message
-            stored = data.message if data.is_encrypted else encrypt_message(data.message)
+            if conv.status == "request":
+                stored = encrypt_message(data.message)
+                is_enc = False
+            else:
+                stored = data.message if data.is_encrypted else encrypt_message(data.message)
+                is_enc = data.is_encrypted
             msg = Message(
                 conversation_id=conv.id,
                 sender_id=current_user.id,
                 content_encrypted=stored,
-                is_encrypted=data.is_encrypted,
+                is_encrypted=is_enc,
             )
             db.add(msg)
             await db.flush()
