@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
@@ -15,6 +15,7 @@ from app.models.user import User
 from app.models.profile_post import ProfilePost, ProfilePostComment, ProfilePostCommentHeart
 from app.models.social import PublicAccountFollow
 from app.models.connection import Connection
+from app.models.notification import Notification
 from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,31 @@ async def get_user_or_404(user_id: str, db: AsyncSession) -> User:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+class UsernameProfileResponse(BaseModel):
+    id: str
+    username: str
+    display_name: str | None
+    avatar_url: str | None
+
+
+@router.get("/by-username/{username}", response_model=UsernameProfileResponse)
+async def get_user_by_username(
+    username: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(User).where(User.username == username.lower()))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UsernameProfileResponse(
+        id=str(user.id),
+        username=user.username,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+    )
 
 
 @router.get("/{user_id}", response_model=UserProfileResponse)
@@ -309,6 +335,19 @@ async def remove_connection(
     conn = result.scalar_one_or_none()
     if conn:
         await db.delete(conn)
+
+    # Delete any pending connection_request notifications between these two users
+    await db.execute(
+        delete(Notification).where(
+            Notification.type == "connection_request",
+            (
+                (Notification.actor_id == current_user.id) & (Notification.user_id == uid)
+            ) | (
+                (Notification.actor_id == uid) & (Notification.user_id == current_user.id)
+            )
+        )
+    )
+
     return {"status": None}
 
 
@@ -343,6 +382,15 @@ async def toggle_profile_post_vote(
         db.add(ProfilePostHeart(user_id=current_user.id, post_id=pid))
         post.heart_count += 1
         has_hearted = True
+
+        if post.author_id != current_user.id:
+            await create_notification(
+                db, post.author_id,
+                type="post_heart",
+                reference_id=post.id,
+                reference_type="profile_post",
+                actor_id=current_user.id,
+            )
 
     post.hot_score = round(
         math.log10(max(post.heart_count, 1)) + post.created_at.timestamp() / 45000, 7
@@ -502,6 +550,18 @@ async def add_profile_post_comment(
     await db.flush()
     await db.refresh(comment)
 
+    # Notify post author of new comment (unless commenter is author)
+    if post.author_id != current_user.id:
+        await create_notification(
+            db,
+            post.author_id,
+            type="post_comment",
+            reference_id=post.id,
+            reference_type="profile_post",
+            actor_id=current_user.id,
+        )
+
+    # Notify parent comment author of reply (unless same as post author or self)
     if parent and parent.author_id != current_user.id and parent.author_id != post.author_id:
         await create_notification(
             db,
@@ -595,8 +655,8 @@ async def toggle_profile_post_comment_heart(
                 db,
                 comment.author_id,
                 type="comment_heart",
-                reference_id=comment.id,
-                reference_type="profile_post_comment",
+                reference_id=post.id,
+                reference_type="profile_post",
                 actor_id=current_user.id,
             )
 

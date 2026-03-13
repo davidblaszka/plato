@@ -2,13 +2,14 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, update as sa_update
 from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.sub import Sub, SubMembership, SubInvite
+from app.models.notification import Notification
 from app.services.notifications import create_notification
 
 router = APIRouter(prefix="/subs", tags=["subs"])
@@ -669,6 +670,18 @@ async def accept_invite(
     membership = SubMembership(sub_id=sub.id, user_id=current_user.id, role="member")
     db.add(membership)
     sub.member_count += 1
+
+    # Mark the sub_invite notification as actioned so Flutter hides the buttons
+    await db.execute(
+        sa_update(Notification)
+        .where(
+            Notification.type == "sub_invite",
+            Notification.user_id == current_user.id,
+            Notification.reference_id == sub.id,
+        )
+        .values(actioned=True)
+    )
+
     await db.flush()
     return {"status": "joined"}
 
@@ -694,6 +707,18 @@ async def decline_invite(
         raise HTTPException(status_code=404, detail="No pending invite found")
 
     invite.status = "declined"
+
+    # Mark the sub_invite notification as actioned so Flutter hides the buttons
+    await db.execute(
+        sa_update(Notification)
+        .where(
+            Notification.type == "sub_invite",
+            Notification.user_id == current_user.id,
+            Notification.reference_id == sub.id,
+        )
+        .values(actioned=True)
+    )
+
     await db.flush()
     return {"status": "declined"}
 

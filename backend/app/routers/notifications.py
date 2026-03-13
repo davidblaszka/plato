@@ -30,6 +30,7 @@ NOTIFICATION_LABELS = {
     "post_heart": "liked your post",
     "comment_heart": "liked your comment",
     "new_follower": "followed you",
+    "mention": "mentioned you in a comment",
 }
 
 NOTIFICATION_ICONS = {
@@ -60,6 +61,7 @@ class NotificationResponse(BaseModel):
     reference_type: str | None
     reference_slug: str | None = None   # slug for sub references
     is_read: bool
+    actioned: bool
     created_at: str
 
 
@@ -112,6 +114,7 @@ async def list_notifications(
             reference_type=n.reference_type,
             reference_slug=sub_slugs.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None,
             is_read=n.is_read,
+            actioned=n.actioned,
             created_at=n.created_at.isoformat(),
         )
         for n in notifs

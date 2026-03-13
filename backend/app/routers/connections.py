@@ -2,7 +2,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_
+from sqlalchemy import select, or_, and_, delete
 from typing import Optional
 
 from app.core.database import get_db
@@ -12,6 +12,7 @@ from app.models.connection import Connection
 from app.models.profile_post import ProfilePost, ProfilePostComment, ProfilePostCommentHeart
 from app.models.social import ProfilePostHeart
 from app.services.notifications import create_notification
+from app.models.notification import Notification
 
 router = APIRouter(tags=["connections"])
 
@@ -187,6 +188,15 @@ async def send_request(
     db.add(conn)
     await db.flush()
     await db.refresh(conn)
+
+    # Remove any stale connection_request notification from this actor to this user
+    await db.execute(
+        delete(Notification).where(
+            Notification.type == "connection_request",
+            Notification.actor_id == current_user.id,
+            Notification.user_id == addressee.id,
+        )
+    )
 
     # Notify the recipient
     await create_notification(
@@ -801,8 +811,8 @@ async def toggle_connection_comment_heart(
                 db,
                 comment.author_id,
                 type="comment_heart",
-                reference_id=comment.id,
-                reference_type="profile_post_comment",
+                reference_id=post.id,
+                reference_type="profile_post",
                 actor_id=current_user.id,
             )
 

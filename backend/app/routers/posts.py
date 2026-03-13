@@ -1,4 +1,5 @@
 import math
+import re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
@@ -562,6 +563,27 @@ async def create_comment(
             reference_type="post",
             actor_id=current_user.id,
         )
+
+    # Parse @mentions and notify each mentioned user once
+    mentioned_usernames = re.findall(r'@(\w+)', data.content)
+    if mentioned_usernames:
+        already_notified = {current_user.id, post.author_id}
+        if parent_id and parent:
+            already_notified.add(parent.author_id)
+        mentioned_result = await db.execute(
+            select(User).where(User.username.in_(mentioned_usernames))
+        )
+        for user in mentioned_result.scalars():
+            if user.id in already_notified:
+                continue
+            already_notified.add(user.id)
+            await create_notification(
+                db, user.id,
+                type="mention",
+                reference_id=post.id,
+                reference_type="post",
+                actor_id=current_user.id,
+            )
 
     return format_comment(comment, current_user)
 
