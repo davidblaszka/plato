@@ -82,6 +82,7 @@ See `backend/.env.example` for all required variables with descriptions.
 
 - [x] Phase 1 — Auth, subs, posts, threaded comments, connections
 - [x] Phase 2 — Public accounts, upvotes, ranking, message requests, search, sub moderation
-- [ ] Phase 3 — Client-side E2EE (Matrix), data export, CSAM scanning, spam detection
-- [ ] Phase 4 — ActivityPub federation
-- [ ] Phase 5 — CDN, push notifications, Elasticsearch, video uploads
+- [x] Phase 3 — Server-side message encryption (Fernet/AES), real-time notifications via WebSocket, sub invite actioning, production deployment (Hetzner VPS, Nginx, SSL/TLS)
+- [ ] Phase 4 — Client-side E2EE (Matrix protocol), data export, CSAM scanning, spam detection
+- [ ] Phase 5 — ActivityPub federation
+- [ ] Phase 6 — CDN, push notifications (APNs/FCM), Elasticsearch, video uploads
