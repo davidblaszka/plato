@@ -15,8 +15,15 @@ class Settings(BaseSettings):
     r2_bucket: str = "plato-media"
     r2_public_url: str = ""
 
+    # Email / notification services — optional, read from .env
+    resend_api_key: str = ""
+    email_from: str = ""
+    email_verification_enabled: bool = False
+    base_url: str = ""
+
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

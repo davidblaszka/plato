@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, or_, and_
 from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
@@ -202,6 +202,20 @@ async def get_profile_posts(
     user = await get_user_or_404(user_id, db)
     uid = parse_uuid(user_id)
 
+    # Private accounts: only show posts to the owner or accepted connections
+    if user.account_type != 'public' and user.id != current_user.id:
+        conn = await db.scalar(
+            select(Connection).where(
+                or_(
+                    and_(Connection.requester_id == current_user.id, Connection.addressee_id == user.id),
+                    and_(Connection.requester_id == user.id, Connection.addressee_id == current_user.id),
+                ),
+                Connection.status == 'accepted',
+            )
+        )
+        if not conn:
+            return ProfilePostsPage(posts=[], has_more=False, next_cursor=None)
+
     stmt = select(ProfilePost).where(ProfilePost.author_id == uid)
     if before is not None:
         try:
@@ -256,6 +270,40 @@ async def create_profile_post(
     await db.flush()
     await db.refresh(post)
     post.hot_score = round(math.log10(1) + post.created_at.timestamp() / 45000, 7)
+    await db.flush()
+    await db.refresh(post)
+    return format_profile_post(post, current_user)
+
+
+class UpdateProfilePostRequest(BaseModel):
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def content_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Content cannot be empty")
+        if len(v) > 10000:
+            raise ValueError("Content too long")
+        return v
+
+
+@router.patch("/{user_id}/profile-posts/{post_id}", response_model=ProfilePostResponse)
+async def edit_profile_post(
+    user_id: str,
+    post_id: str,
+    data: UpdateProfilePostRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pid = parse_uuid(post_id)
+    result = await db.execute(select(ProfilePost).where(ProfilePost.id == pid))
+    post = result.scalar_one_or_none()
+    if not post or post.author_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    post.content = data.content
+    post.is_edited = True
     await db.flush()
     await db.refresh(post)
     return format_profile_post(post, current_user)
@@ -466,7 +514,7 @@ async def list_profile_post_comments(
     comments_result = await db.execute(
         select(ProfilePostComment)
         .where(ProfilePostComment.post_id == pid)
-        .order_by(ProfilePostComment.created_at.asc())
+        .order_by(func.coalesce(ProfilePostComment.parent_id, ProfilePostComment.id), ProfilePostComment.created_at.asc())
         .limit(200)
     )
     comments = comments_result.scalars().all()

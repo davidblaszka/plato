@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, update
+from sqlalchemy import select, and_, update, func
 from typing import Optional
 
 from app.core.database import get_db
@@ -609,7 +609,7 @@ async def list_comments(
     result = await db.execute(
         select(Comment)
         .where(Comment.post_id == post.id)
-        .order_by(Comment.created_at.asc())
+        .order_by(func.coalesce(Comment.parent_id, Comment.id), Comment.created_at.asc())
     )
     comments = result.scalars().all()
 

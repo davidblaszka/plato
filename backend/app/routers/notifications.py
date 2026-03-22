@@ -100,11 +100,21 @@ async def list_notifications(
         subs_result = await db.execute(select(Sub).where(Sub.id.in_(sub_ref_ids)))
         sub_slugs = {s.id: s.slug for s in subs_result.scalars().all()}
 
+    def _label(n, slug: str | None) -> str:
+        if slug:
+            if n.type == 'sub_invite':
+                return f"invited you to join {slug}"
+            if n.type == 'sub_join_request':
+                return f"requested to join {slug}"
+            if n.type == 'sub_join':
+                return f"joined {slug}"
+        return NOTIFICATION_LABELS.get(n.type, n.type)
+
     return [
         NotificationResponse(
             id=str(n.id),
             type=n.type,
-            label=NOTIFICATION_LABELS.get(n.type, n.type),
+            label=_label(n, sub_slugs.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None),
             icon=NOTIFICATION_ICONS.get(n.type, "notifications"),
             actor_id=str(n.actor_id) if n.actor_id else None,
             actor_username=actors[n.actor_id].username if n.actor_id and n.actor_id in actors else None,
