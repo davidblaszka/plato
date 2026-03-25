@@ -809,7 +809,7 @@ async def send_message(
     )
 
 
-@router.patch("/{message_id}", response_model=MessageResponse)
+@router.patch("/{message_id}/edit", response_model=MessageResponse)
 async def edit_message(
     message_id: str,
     data: EditMessageRequest,

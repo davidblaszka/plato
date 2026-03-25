@@ -60,6 +60,7 @@ class NotificationResponse(BaseModel):
     reference_id: str | None
     reference_type: str | None
     reference_slug: str | None = None   # slug for sub references
+    reference_name: str | None = None   # display name for sub references
     is_read: bool
     actioned: bool
     created_at: str
@@ -96,25 +97,32 @@ async def list_notifications(
     # Batch-fetch sub slugs for sub-type notifications
     sub_ref_ids = list({n.reference_id for n in notifs if n.reference_type == "sub" and n.reference_id})
     sub_slugs: dict = {}
+    sub_names: dict = {}
     if sub_ref_ids:
         subs_result = await db.execute(select(Sub).where(Sub.id.in_(sub_ref_ids)))
-        sub_slugs = {s.id: s.slug for s in subs_result.scalars().all()}
+        subs = subs_result.scalars().all()
+        sub_slugs = {s.id: s.slug for s in subs}
+        sub_names = {s.id: s.name for s in subs}
 
-    def _label(n, slug: str | None) -> str:
-        if slug:
+    def _label(n, name_or_slug: str | None) -> str:
+        if name_or_slug:
             if n.type == 'sub_invite':
-                return f"invited you to join {slug}"
+                return f"invited you to join {name_or_slug}"
             if n.type == 'sub_join_request':
-                return f"requested to join {slug}"
+                return f"requested to join {name_or_slug}"
             if n.type == 'sub_join':
-                return f"joined {slug}"
+                return f"joined {name_or_slug}"
         return NOTIFICATION_LABELS.get(n.type, n.type)
 
     return [
         NotificationResponse(
             id=str(n.id),
             type=n.type,
-            label=_label(n, sub_slugs.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None),
+            label=_label(
+                n,
+                (sub_names.get(n.reference_id) or sub_slugs.get(n.reference_id))
+                if n.reference_type == "sub" and n.reference_id else None,
+            ),
             icon=NOTIFICATION_ICONS.get(n.type, "notifications"),
             actor_id=str(n.actor_id) if n.actor_id else None,
             actor_username=actors[n.actor_id].username if n.actor_id and n.actor_id in actors else None,
@@ -123,6 +131,7 @@ async def list_notifications(
             reference_id=str(n.reference_id) if n.reference_id else None,
             reference_type=n.reference_type,
             reference_slug=sub_slugs.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None,
+            reference_name=sub_names.get(n.reference_id) if n.reference_type == "sub" and n.reference_id else None,
             is_read=n.is_read,
             actioned=n.actioned,
             created_at=n.created_at.isoformat(),
