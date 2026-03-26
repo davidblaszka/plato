@@ -876,10 +876,11 @@ async def delete_message(
         raise HTTPException(status_code=403, detail="Not your message")
 
     conv_id = msg.conversation_id
+    client_id = msg.client_id
     await db.delete(msg)
     await db.flush()
 
-    await _broadcast_message_deleted(conv_id, mid, current_user.id, db)
+    await _broadcast_message_deleted(conv_id, mid, current_user.id, db, client_id=client_id)
 
 
 @router.post("/{conversation_id}/encrypted", response_model=MessageResponse, status_code=201)
@@ -1217,7 +1218,7 @@ async def _push_message(conversation_id, msg: Message, sender: User, db: AsyncSe
             await message_manager.send_to_user(str(p.user_id), payload)
 
 
-async def _broadcast_message_deleted(conversation_id, message_id, sender_id, db: AsyncSession):
+async def _broadcast_message_deleted(conversation_id, message_id, sender_id, db: AsyncSession, client_id=None):
     result = await db.execute(
         select(ConversationParticipant).where(
             ConversationParticipant.conversation_id == conversation_id
@@ -1229,6 +1230,8 @@ async def _broadcast_message_deleted(conversation_id, message_id, sender_id, db:
         "conversation_id": str(conversation_id),
         "message_id": str(message_id),
     }
+    if client_id is not None:
+        payload["client_id"] = str(client_id)
     for p in participants:
         if str(p.user_id) == str(sender_id):
             continue
