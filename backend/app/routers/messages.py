@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +10,7 @@ from app.core.database import get_db, AsyncSessionLocal
 from app.core.security import get_current_user
 from app.core.config import settings
 from app.models.user import User
-from app.models.message import Conversation, ConversationParticipant, Message
+from app.models.message import Conversation, ConversationParticipant, Message, MessageReaction
 from app.services.encryption import encrypt_message, decrypt_message
 from app.services.messaging import message_manager
 
@@ -164,6 +165,17 @@ class MessageSyncItem(BaseModel):
     """Lightweight sync item — id + timestamp only, no content."""
     id: str
     sent_at: str
+
+
+class ReactionRequest(BaseModel):
+    reaction: str | None  # emoji string, or None / empty string to clear
+
+    @field_validator("reaction")
+    @classmethod
+    def reaction_valid(cls, v: str | None) -> str | None:
+        if v is not None and len(v) > 32:
+            raise ValueError("Reaction too long")
+        return v or None  # coerce empty string to None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1269,5 +1281,93 @@ async def _broadcast_message_edited(
     participants = result.scalars().all()
     for p in participants:
         if str(p.user_id) == str(sender.id):
+            continue
+        await message_manager.send_to_user(str(p.user_id), payload)
+
+
+# ── Reactions ─────────────────────────────────────────────────────────────────
+
+@router.post("/{message_id}/react", status_code=204)
+async def react_to_message(
+    message_id: uuid.UUID,
+    data: ReactionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message).where(Message.id == message_id)
+    )
+    msg = result.scalar_one_or_none()
+    if msg is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Verify the current user is a participant in this conversation.
+    part_result = await db.execute(
+        select(ConversationParticipant).where(
+            and_(
+                ConversationParticipant.conversation_id == msg.conversation_id,
+                ConversationParticipant.user_id == current_user.id,
+            )
+        )
+    )
+    if part_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    if data.reaction:
+        existing = await db.execute(
+            select(MessageReaction).where(
+                and_(
+                    MessageReaction.message_id == message_id,
+                    MessageReaction.user_id == current_user.id,
+                )
+            )
+        )
+        row = existing.scalar_one_or_none()
+        if row:
+            row.reaction = data.reaction
+        else:
+            db.add(MessageReaction(
+                message_id=message_id,
+                user_id=current_user.id,
+                reaction=data.reaction,
+            ))
+    else:
+        await db.execute(
+            select(MessageReaction).where(
+                and_(
+                    MessageReaction.message_id == message_id,
+                    MessageReaction.user_id == current_user.id,
+                )
+            )
+        )
+        await db.execute(
+            MessageReaction.__table__.delete().where(
+                and_(
+                    MessageReaction.message_id == message_id,
+                    MessageReaction.user_id == current_user.id,
+                )
+            )
+        )
+
+    await db.commit()
+    await _broadcast_reaction(msg.conversation_id, message_id, msg.client_id, data.reaction, current_user.id, db)
+
+
+async def _broadcast_reaction(conversation_id, message_id, client_id, reaction, sender_id, db: AsyncSession):
+    result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == conversation_id
+        )
+    )
+    participants = result.scalars().all()
+    payload = {
+        "type": "message_reaction",
+        "conversation_id": str(conversation_id),
+        "message_id": str(message_id),
+        "client_id": str(client_id) if client_id else None,
+        "reaction": reaction,
+    }
+    for p in participants:
+        if str(p.user_id) == str(sender_id):
             continue
         await message_manager.send_to_user(str(p.user_id), payload)
